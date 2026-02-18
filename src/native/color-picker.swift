@@ -8,7 +8,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let sampler = NSColorSampler()
         sampler.show { selectedColor in
             if let color = selectedColor?.usingColorSpace(.sRGB) {
-                let json = "{\"red\":\(color.redComponent),\"green\":\(color.greenComponent),\"blue\":\(color.blueComponent),\"alpha\":\(color.alphaComponent)}"
+                let json = "{\"red\":\(color.redComponent),\"green\":\(color.greenComponent),\"blue\":\(color.blueComponent),\"alpha\":\(color.alphaComponent),\"colorSpace\":\"srgb\"}"
                 FileHandle.standardOutput.write(json.data(using: .utf8)!)
             } else {
                 FileHandle.standardOutput.write("null".data(using: .utf8)!)

@@ -134,6 +134,15 @@ const ExtensionsTab: React.FC<{
     void loadData();
   }, [loadData]);
 
+  useEffect(() => {
+    const dispose = window.electron.onExtensionsChanged(() => {
+      void loadData();
+    });
+    return () => {
+      dispose?.();
+    };
+  }, [loadData]);
+
   const commandBySchemaKey = useMemo(() => {
     const map = new Map<string, CommandInfo>();
     for (const cmd of commands) {

@@ -65,6 +65,18 @@ const StoreTab: React.FC<{ embedded?: boolean }> = ({ embedded = false }) => {
     loadCatalog();
   }, [loadCatalog]);
 
+  useEffect(() => {
+    const dispose = window.electron.onExtensionsChanged(() => {
+      window.electron
+        .getInstalledExtensionNames()
+        .then((installed) => setInstalledNames(new Set(installed)))
+        .catch(() => {});
+    });
+    return () => {
+      dispose?.();
+    };
+  }, []);
+
   const filteredCatalog = useMemo(() => {
     if (!searchQuery.trim()) return catalog;
     const q = searchQuery.toLowerCase();

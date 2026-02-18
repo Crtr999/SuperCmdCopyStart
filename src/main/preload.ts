@@ -294,6 +294,13 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.invoke('install-extension', name),
   uninstallExtension: (name: string): Promise<boolean> =>
     ipcRenderer.invoke('uninstall-extension', name),
+  onExtensionsChanged: (callback: () => void): (() => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('extensions-updated', listener);
+    return () => {
+      ipcRenderer.removeListener('extensions-updated', listener);
+    };
+  },
 
   // ─── Extension APIs (for @raycast/api compatibility) ─────────────
 
@@ -496,7 +503,7 @@ contextBridge.exposeInMainWorld('electron', {
     ipcRenderer.invoke('prompt-apply-generated-text', payload),
 
   // ─── Native Helpers ─────────────────────────────────────────────
-  nativePickColor: (): Promise<{ red: number; green: number; blue: number; alpha: number } | null> =>
+  nativePickColor: (): Promise<{ red: number; green: number; blue: number; alpha: number; colorSpace: string } | null> =>
     ipcRenderer.invoke('native-pick-color'),
   pickFiles: (options?: {
     allowMultipleSelection?: boolean;

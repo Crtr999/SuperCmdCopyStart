@@ -344,6 +344,7 @@ export interface ElectronAPI {
   getInstalledExtensionNames: () => Promise<string[]>;
   installExtension: (name: string) => Promise<boolean>;
   uninstallExtension: (name: string) => Promise<boolean>;
+  onExtensionsChanged: (callback: () => void) => (() => void);
 
   // Extension APIs (for @raycast/api compatibility)
   httpRequest: (options: {
@@ -439,7 +440,7 @@ export interface ElectronAPI {
   promptApplyGeneratedText: (payload: { previousText?: string; nextText: string }) => Promise<boolean>;
 
   // Native helpers
-  nativePickColor: () => Promise<{ red: number; green: number; blue: number; alpha: number } | null>;
+  nativePickColor: () => Promise<{ red: number; green: number; blue: number; alpha: number; colorSpace: string } | null>;
   pickFiles: (options?: {
     allowMultipleSelection?: boolean;
     canChooseDirectories?: boolean;

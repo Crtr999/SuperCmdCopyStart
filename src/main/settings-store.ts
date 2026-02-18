@@ -64,7 +64,7 @@ const DEFAULT_AI_SETTINGS: AISettings = {
   speechLanguage: 'en-US',
   textToSpeechModel: 'edge-tts',
   edgeTtsVoice: 'en-US-EricNeural',
-  speechCorrectionEnabled: true,
+  speechCorrectionEnabled: false,
   enabled: true,
   openaiCompatibleBaseUrl: '',
   openaiCompatibleApiKey: '',

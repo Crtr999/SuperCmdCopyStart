@@ -112,9 +112,11 @@ export function nextMenuBarSectionOrder(): number {
 
 function pickMenuBarIconSource(icon: any): string {
   if (!icon || typeof icon !== 'object') return '';
+  if (typeof icon.fileIcon === 'string') return icon.fileIcon;
   if (icon.source !== undefined) {
     if (typeof icon.source === 'string') return icon.source;
     if (icon.source && typeof icon.source === 'object') {
+      if (typeof icon.source.fileIcon === 'string') return icon.source.fileIcon;
       return icon.source.light || icon.source.dark || '';
     }
   }

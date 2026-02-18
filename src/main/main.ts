@@ -4795,6 +4795,15 @@ function sendAppUpdaterStatusToRenderers(): void {
   }
 }
 
+function broadcastExtensionsUpdated(): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue;
+    try {
+      window.webContents.send('extensions-updated');
+    } catch {}
+  }
+}
+
 function updateAppUpdaterStatus(patch: Partial<AppUpdaterStatusSnapshot>): void {
   appUpdaterStatusSnapshot = {
     ...appUpdaterStatusSnapshot,
@@ -6983,6 +6992,7 @@ return appURL's |path|() as text`,
       }
       // Invalidate command cache so new extensions appear in the launcher
       invalidateCache();
+      broadcastExtensionsUpdated();
       return true;
     }
   );
@@ -6994,6 +7004,7 @@ return appURL's |path|() as text`,
       if (success) {
         // Invalidate command cache so removed extensions disappear
         invalidateCache();
+        broadcastExtensionsUpdated();
       }
       return success;
     }
@@ -7960,8 +7971,36 @@ return appURL's |path|() as text`,
           }
 
           try {
-            const color = JSON.parse(trimmed);
-            resolve(color);
+            const parsedColor = JSON.parse(trimmed);
+            if (!parsedColor || typeof parsedColor !== 'object') {
+              resolve(null);
+              return;
+            }
+
+            const toUnitRange = (value: unknown): number | null => {
+              const numeric = Number(value);
+              if (!Number.isFinite(numeric)) return null;
+              if (numeric > 1) {
+                const normalized = numeric / 255;
+                return Math.max(0, Math.min(1, normalized));
+              }
+              return Math.max(0, Math.min(1, numeric));
+            };
+
+            const red = toUnitRange((parsedColor as any).red);
+            const green = toUnitRange((parsedColor as any).green);
+            const blue = toUnitRange((parsedColor as any).blue);
+            const alpha = toUnitRange((parsedColor as any).alpha ?? 1);
+            if (red === null || green === null || blue === null || alpha === null) {
+              resolve(null);
+              return;
+            }
+
+            const colorSpace = typeof (parsedColor as any).colorSpace === 'string' && (parsedColor as any).colorSpace.trim()
+              ? String((parsedColor as any).colorSpace)
+              : 'srgb';
+
+            resolve({ red, green, blue, alpha, colorSpace });
           } catch (e) {
             console.error('Failed to parse color picker output:', e);
             resolve(null);
