@@ -594,16 +594,20 @@ async function discoverApplications(): Promise<CommandInfo[]> {
     path.join(process.env.HOME || '', 'Applications'),
   ];
 
+  // Run Spotlight query and filesystem scan in parallel
   const appPathsSet = new Set<string>();
-  const spotlightPaths = await discoverAppBundlesViaSpotlight(appDirs);
+  const [spotlightPaths] = await Promise.all([
+    discoverAppBundlesViaSpotlight(appDirs),
+    Promise.resolve().then(() => {
+      for (const dir of appDirs) {
+        for (const appPath of collectAppBundles(dir)) {
+          appPathsSet.add(appPath);
+        }
+      }
+    }),
+  ]);
   for (const appPath of spotlightPaths) {
     appPathsSet.add(appPath);
-  }
-
-  for (const dir of appDirs) {
-    for (const appPath of collectAppBundles(dir)) {
-      appPathsSet.add(appPath);
-    }
   }
   const finderPath = '/System/Library/CoreServices/Finder.app';
   if (fs.existsSync(finderPath)) {
@@ -611,7 +615,7 @@ async function discoverApplications(): Promise<CommandInfo[]> {
   }
 
   const appPaths = Array.from(appPathsSet).sort((a, b) => a.localeCompare(b));
-  const BATCH = 6;
+  const BATCH = 15;
   for (let i = 0; i < appPaths.length; i += BATCH) {
     const batch = appPaths.slice(i, i + BATCH);
     const items = await Promise.all(
@@ -686,7 +690,7 @@ async function discoverSystemSettings(): Promise<CommandInfo[]> {
 
     const allAppex = files.filter((f) => f.endsWith('.appex'));
 
-    const BATCH = 6;
+    const BATCH = 15;
     for (let i = 0; i < allAppex.length; i += BATCH) {
       const batch = allAppex.slice(i, i + BATCH);
       const items = await Promise.all(
@@ -782,7 +786,7 @@ async function discoverSystemSettings(): Promise<CommandInfo[]> {
       }
     }
 
-    const BATCH = 6;
+    const BATCH = 15;
     for (let i = 0; i < panePaths.length; i += BATCH) {
       const batch = panePaths.slice(i, i + BATCH);
       const items = await Promise.all(
@@ -868,11 +872,13 @@ async function discoverAndBuildCommands(): Promise<CommandInfo[]> {
   const t0 = Date.now();
   console.log('Discovering applications and settings…');
 
-  // Run discovery sequentially to reduce startup process churn.
-  // On some systems, launching too many plist/icon subprocesses in parallel can
-  // destabilize Electron during early startup.
-  const apps = await discoverApplications();
-  const settings = await discoverSystemSettings();
+  // Run app and settings discovery in parallel.
+  // Icon extraction mostly hits the disk cache after the first run,
+  // so parallel execution is safe and roughly halves discovery time.
+  const [apps, settings] = await Promise.all([
+    discoverApplications(),
+    discoverSystemSettings(),
+  ]);
 
   apps.sort((a, b) => a.title.localeCompare(b.title));
   settings.sort((a, b) => a.title.localeCompare(b.title));
