@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Sparkles, ArrowRight, Loader2 } from 'lucide-react';
+import { X, Sparkles, ArrowRight, Loader2, FileText } from 'lucide-react';
 import type { CommandInfo, ExtensionBundle, AppSettings } from '../types/electron';
 import ExtensionView from './ExtensionView';
 import ClipboardManager from './ClipboardManager';
@@ -56,6 +56,7 @@ const App: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
+  const [inlineFileResults, setInlineFileResults] = useState<string[]>([]);
   const {
     extensionView, extensionPreferenceSetup, scriptCommandSetup, scriptCommandOutput,
     showClipboardManager, showSnippetManager, showFileSearch, showCursorPrompt,
@@ -744,6 +745,32 @@ const App: React.FC = () => {
   }, [searchQuery, syncCalcResult]);
   const calcResult = syncCalcResult ?? asyncCalcResult;
   const calcOffset = calcResult ? 1 : 0;
+
+  // ── Inline file search (Spotlight, debounced) ──────────────────────────────
+  useEffect(() => {
+    setInlineFileResults([]);
+    const trimmed = searchQuery.trim();
+    if (trimmed.length < 2) return;
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const homeDir = (window.electron as any).homeDir as string || '';
+        const terms = trimmed.split(/\s+/).filter(Boolean);
+        const spotQuery = terms
+          .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
+          .join(' && ');
+        const args = homeDir ? ['-onlyin', homeDir, spotQuery] : [spotQuery];
+        const res = await window.electron.execCommand('mdfind', args);
+        const files = (res.stdout || '').split('\n').filter(Boolean).slice(0, 5);
+        setInlineFileResults(files);
+      } catch {
+        setInlineFileResults([]);
+      }
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
   const contextualCommands = commands;
   const filteredCommands = useMemo(
     () => filterCommands(contextualCommands, searchQuery),
@@ -795,8 +822,8 @@ const App: React.FC = () => {
   );
 
   useEffect(() => {
-    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset);
-  }, [displayCommands.length, calcOffset]);
+    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset + inlineFileResults.length);
+  }, [displayCommands.length, calcOffset, inlineFileResults.length]);
 
   const scrollToSelected = useCallback(() => {
     const selectedElement = itemRefs.current[selectedIndex];
@@ -823,9 +850,9 @@ const App: React.FC = () => {
   }, [searchQuery]);
 
   useEffect(() => {
-    const max = Math.max(0, displayCommands.length + calcOffset - 1);
+    const max = Math.max(0, displayCommands.length + calcOffset + inlineFileResults.length - 1);
     setSelectedIndex((prev) => (prev > max ? max : prev));
-  }, [displayCommands.length, calcOffset]);
+  }, [displayCommands.length, calcOffset, inlineFileResults.length]);
 
   const selectedCommand =
     selectedIndex >= calcOffset
@@ -911,7 +938,7 @@ const App: React.FC = () => {
         case 'ArrowDown':
           e.preventDefault();
           setSelectedIndex((prev) => {
-            const max = displayCommands.length + calcOffset - 1;
+            const max = displayCommands.length + calcOffset + inlineFileResults.length - 1;
             return prev < max ? prev + 1 : prev;
           });
           break;
@@ -926,6 +953,12 @@ const App: React.FC = () => {
           if (calcResult && selectedIndex === 0) {
             navigator.clipboard.writeText(calcResult.result);
             window.electron.hideWindow();
+          } else if (selectedIndex >= calcOffset + displayCommands.length && inlineFileResults.length > 0) {
+            const filePath = inlineFileResults[selectedIndex - calcOffset - displayCommands.length];
+            if (filePath) {
+              void window.electron.execCommand('open', [filePath]);
+              window.electron.hideWindow();
+            }
           } else if (displayCommands[selectedIndex - calcOffset]) {
             handleCommandExecute(displayCommands[selectedIndex - calcOffset]);
           }
@@ -955,6 +988,7 @@ const App: React.FC = () => {
       startAiChat,
       calcResult,
       calcOffset,
+      inlineFileResults,
       togglePinSelectedCommand,
       disableSelectedCommand,
       uninstallSelectedExtension,
@@ -1756,7 +1790,7 @@ const App: React.FC = () => {
           <input
             ref={inputRef}
             type="text"
-            placeholder="Search apps and settings..."
+            placeholder="Search apps, files, and settings..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -1792,7 +1826,7 @@ const App: React.FC = () => {
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">Discovering apps...</p>
             </div>
-          ) : displayCommands.length === 0 && !calcResult ? (
+          ) : displayCommands.length === 0 && !calcResult && inlineFileResults.length === 0 ? (
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">No matching results</p>
             </div>
@@ -1898,6 +1932,52 @@ const App: React.FC = () => {
                   },
                   { nodes: [] as React.ReactNode[], index: 0 }
                 ).nodes}
+
+              {/* Inline file results */}
+              {inlineFileResults.length > 0 && (
+                <div>
+                  <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-white/50 font-semibold">
+                    Files
+                  </div>
+                  {inlineFileResults.map((filePath, i) => {
+                    const absIndex = calcOffset + displayCommands.length + i;
+                    const fileName = filePath.split('/').pop() || filePath;
+                    const dirPath = filePath.split('/').slice(0, -1).join('/');
+                    const homeDir = (window.electron as any).homeDir as string || '';
+                    const shortDir = homeDir && dirPath.startsWith(homeDir)
+                      ? `~${dirPath.slice(homeDir.length) || '/'}`
+                      : dirPath;
+                    return (
+                      <div
+                        key={`file-${filePath}-${i}`}
+                        ref={(el) => (itemRefs.current[absIndex] = el)}
+                        className={`command-item px-3 py-2 rounded-lg cursor-pointer ${
+                          absIndex === selectedIndex ? 'selected' : ''
+                        }`}
+                        onClick={() => {
+                          void window.electron.execCommand('open', [filePath]);
+                          window.electron.hideWindow();
+                        }}
+                        onMouseMove={() => setSelectedIndex(absIndex)}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-5 h-5 flex items-center justify-center flex-shrink-0">
+                            <FileText className="w-3.5 h-3.5 text-blue-400" />
+                          </div>
+                          <div className="min-w-0 flex-1 flex items-center gap-2">
+                            <div className="text-white/95 text-[13px] font-semibold truncate tracking-[0.004em]">
+                              {fileName}
+                            </div>
+                            <div className="text-white/50 text-[11px] font-medium truncate">
+                              {shortDir}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
         </div>

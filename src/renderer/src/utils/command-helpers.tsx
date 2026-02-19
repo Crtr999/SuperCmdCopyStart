@@ -37,6 +37,27 @@ export type ReadVoiceOption = {
 };
 
 /**
+ * Fuzzy character-sequence scorer.
+ * All query chars must appear in order in target.
+ * Consecutive runs are rewarded so "bgt" scores lower than "bud".
+ */
+function fuzzyScore(query: string, target: string): number {
+  let qi = 0;
+  let score = 0;
+  let run = 0;
+  for (let ti = 0; ti < target.length && qi < query.length; ti++) {
+    if (target[ti] === query[qi]) {
+      run++;
+      score += run; // 1+2+3… reward for consecutive matches
+      qi++;
+    } else {
+      run = 0;
+    }
+  }
+  return qi < query.length ? 0 : score;
+}
+
+/**
  * Filter and sort commands based on search query
  */
 export function filterCommands(commands: CommandInfo[], query: string): CommandInfo[] {
@@ -77,6 +98,18 @@ export function filterCommands(commands: CommandInfo[], query: string): CommandI
       // Subtitle match
       else if (lowerSubtitle.includes(lowerQuery)) {
         score = 22;
+      }
+
+      // Fuzzy character-sequence match (lowest tier, below all exact/substring tiers)
+      if (score === 0) {
+        const q = lowerQuery.replace(/\s+/g, '');
+        const titleFuzzy = fuzzyScore(q, lowerTitle);
+        if (titleFuzzy > 0) {
+          score = Math.min(20, titleFuzzy);
+        } else {
+          const kwFuzzy = keywords.reduce((best, k) => Math.max(best, fuzzyScore(q, k)), 0);
+          if (kwFuzzy > 0) score = Math.min(15, kwFuzzy);
+        }
       }
 
       return { cmd, score };
