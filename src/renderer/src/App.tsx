@@ -912,7 +912,7 @@ const App: React.FC = () => {
           setFileResults([]);
         }
       }
-    }, 150);
+    }, 50);
 
     return () => window.clearTimeout(timer);
   }, [searchQuery]);
