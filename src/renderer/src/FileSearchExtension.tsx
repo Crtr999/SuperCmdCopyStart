@@ -113,15 +113,11 @@ function matchesFileNameTerms(filePath: string, terms: string[]): boolean {
   if (terms.length === 0) return true;
   const name = basename(filePath);
   const normalizedName = normalizeForMatch(name);
-  const tokens = splitNameTokens(name);
-  return terms.every((term) => {
-    // If query includes punctuation (e.g. ".js"), allow direct substring check.
-    if (/[^a-z0-9]/i.test(term)) {
-      return normalizedName.includes(term);
-    }
-    // Otherwise require token-prefix matching to avoid mid-word false positives.
-    return tokens.some((token) => token.startsWith(term));
-  });
+  // Simple substring check — Spotlight already found the file by name, so we
+  // just verify each term appears somewhere in the filename itself (not a
+  // parent directory).  Token-prefix matching was too strict and discarded
+  // valid results (e.g. searching "eadme" would reject "README.md").
+  return terms.every((term) => normalizedName.includes(term));
 }
 
 const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose, initialQuery }) => {
@@ -215,20 +211,34 @@ const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose, init
     const timer = window.setTimeout(async () => {
       setIsLoading(true);
       try {
-        const spotlightQuery = buildNameOnlySpotlightQuery(trimmed);
-        const mdfindArgs = currentScope.path
-          ? ['-onlyin', currentScope.path, spotlightQuery]
-          : [spotlightQuery];
-        const response = await window.electron.execCommand('mdfind', mdfindArgs);
-        if (searchRequestRef.current !== requestId) return;
-
         const terms = getNormalizedTerms(trimmed);
-        const lines = response.stdout
-          .split('\n')
-          .map((line) => line.trim())
-          .filter(Boolean);
 
-        // Hard guard: keep only entries whose own file/folder name matches all terms.
+        // Try Spotlight first — fast and index-backed.
+        let lines: string[] = [];
+        try {
+          const spotlightQuery = buildNameOnlySpotlightQuery(trimmed);
+          const mdfindArgs = currentScope.path
+            ? ['-onlyin', currentScope.path, spotlightQuery]
+            : [spotlightQuery];
+          const response = await window.electron.execCommand('mdfind', mdfindArgs);
+          if (searchRequestRef.current !== requestId) return;
+          lines = response.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+        } catch { /* ignore, fall through to find */ }
+
+        // Fall back to `find` when Spotlight returns nothing (Full Disk Access
+        // not granted, Spotlight disabled, or index not yet built).
+        if (lines.length === 0 && currentScope.path) {
+          try {
+            const response = await window.electron.execCommand('/usr/bin/find', [
+              currentScope.path, '-maxdepth', '8', '-iname', `*${trimmed}*`,
+              '-not', '-path', '*/.*',
+            ]);
+            if (searchRequestRef.current !== requestId) return;
+            lines = response.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+          } catch { /* ignore */ }
+        }
+
+        // Keep only results whose filename actually contains all search terms.
         const strictNameMatches = lines.filter((filePath) => matchesFileNameTerms(filePath, terms));
 
         const deduped = Array.from(new Set(strictNameMatches));

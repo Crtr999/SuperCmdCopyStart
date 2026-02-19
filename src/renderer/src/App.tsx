@@ -746,7 +746,7 @@ const App: React.FC = () => {
   const calcResult = syncCalcResult ?? asyncCalcResult;
   const calcOffset = calcResult ? 1 : 0;
 
-  // ── Inline file search (Spotlight, debounced) ──────────────────────────────
+  // ── Inline file search (Spotlight with find fallback, debounced) ──────────
   useEffect(() => {
     setInlineFileResults([]);
     const trimmed = searchQuery.trim();
@@ -755,19 +755,37 @@ const App: React.FC = () => {
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir as string || '';
-        // Use mdfind -name for reliable substring filename matching.
-        // -onlyin homeDir keeps results user-relevant and fast.
-        const args: string[] = [];
-        if (homeDir) args.push('-onlyin', homeDir);
-        args.push('-name', trimmed);
-        const res = await window.electron.execCommand('/usr/bin/mdfind', args);
-        const files = (res.stdout || '')
-          .split('\n')
-          .filter(Boolean)
-          // Skip hidden files/dirs and system paths
-          .filter((f) => !f.split('/').some((part) => part.startsWith('.')))
-          .filter((f) => !f.startsWith('/System') && !f.startsWith('/private/var'))
-          .slice(0, 8);
+
+        const filterPaths = (raw: string) =>
+          raw
+            .split('\n')
+            .filter(Boolean)
+            .filter((f) => !f.split('/').some((part) => part.startsWith('.')))
+            .filter((f) => !f.startsWith('/System') && !f.startsWith('/private/var'))
+            .slice(0, 8);
+
+        // Try Spotlight first — fast and index-backed.
+        let files: string[] = [];
+        try {
+          const args: string[] = [];
+          if (homeDir) args.push('-onlyin', homeDir);
+          args.push('-name', trimmed);
+          const res = await window.electron.execCommand('/usr/bin/mdfind', args);
+          files = filterPaths(res.stdout || '');
+        } catch { /* ignore, fall through to find */ }
+
+        // Fall back to `find` if Spotlight returned nothing (e.g. Full Disk
+        // Access not granted, Spotlight disabled, or index not ready).
+        if (files.length === 0 && homeDir) {
+          try {
+            const res = await window.electron.execCommand('/usr/bin/find', [
+              homeDir, '-maxdepth', '6', '-iname', `*${trimmed}*`,
+              '-not', '-path', '*/.*',
+            ]);
+            files = filterPaths(res.stdout || '');
+          } catch { /* ignore */ }
+        }
+
         setInlineFileResults(files);
       } catch {
         setInlineFileResults([]);
