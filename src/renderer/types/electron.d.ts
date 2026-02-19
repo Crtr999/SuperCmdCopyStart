@@ -9,7 +9,7 @@ export interface CommandInfo {
   keywords?: string[];
   iconDataUrl?: string;
   iconEmoji?: string;
-  category: 'app' | 'settings' | 'system' | 'extension' | 'script';
+  category: 'app' | 'settings' | 'system' | 'extension' | 'script' | 'file';
   path?: string;
   mode?: string;
   interval?: string;

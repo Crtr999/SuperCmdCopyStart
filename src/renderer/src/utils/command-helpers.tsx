@@ -13,7 +13,7 @@
  */
 
 import React from 'react';
-import { Search, Power, Settings, Puzzle, Sparkles, Clipboard, FileText, Mic, Volume2, Brain, TerminalSquare } from 'lucide-react';
+import { Search, Power, Settings, Puzzle, Sparkles, Clipboard, FileText, File as FileIcon, Mic, Volume2, Brain, TerminalSquare } from 'lucide-react';
 import type { CommandInfo, EdgeTtsVoice } from '../../types/electron';
 import supercmdLogo from '../../../../supercmd.svg';
 
@@ -170,6 +170,8 @@ export function getCategoryLabel(category: string): string {
       return 'Extension';
     case 'script':
       return 'Script';
+    case 'file':
+      return 'File';
     case 'app':
     default:
       return 'Application';
@@ -330,6 +332,13 @@ export function renderCommandIcon(command: CommandInfo): React.ReactNode {
     return (
       <div className="w-5 h-5 rounded bg-emerald-500/20 flex items-center justify-center">
         <TerminalSquare className="w-3 h-3 text-emerald-300" />
+      </div>
+    );
+  }
+  if (command.category === 'file') {
+    return (
+      <div className="w-5 h-5 rounded bg-blue-500/20 flex items-center justify-center">
+        <FileIcon className="w-3 h-3 text-blue-300" />
       </div>
     );
   }

@@ -206,6 +206,20 @@ select {
   border-color: rgba(255, 255, 255, 0.1);
 }
 
+/* Drag handle for pinned items — hidden by default, visible on hover */
+.command-item .drag-handle {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.command-item:hover .drag-handle {
+  opacity: 0.4;
+}
+
+.command-item .drag-handle:hover {
+  opacity: 0.7;
+}
+
 /* Search input — inline, no background */
 .search-input-inline:focus {
   outline: none;

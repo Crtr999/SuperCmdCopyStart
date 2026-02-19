@@ -59,6 +59,40 @@ interface InlineFileResult {
 
 const ICLOUD_DRIVE_SUBPATH = '/Library/Mobile Documents/com~apple~CloudDocs';
 
+// ─── Pinned file helpers ────────────────────────────────────────────
+const FILE_PIN_PREFIX = 'file:';
+
+interface PinnedFileItem {
+  id: string;          // "file:<path>"
+  path: string;
+  name: string;
+  location: string;
+  iconDataUrl?: string;
+}
+
+function isPinnedFileId(id: string): boolean {
+  return id.startsWith(FILE_PIN_PREFIX);
+}
+
+function pinnedFileIdToPath(id: string): string {
+  return id.slice(FILE_PIN_PREFIX.length);
+}
+
+function pathToPinnedFileId(filePath: string): string {
+  return FILE_PIN_PREFIX + filePath;
+}
+
+function pinnedFileToCommandInfo(file: PinnedFileItem): CommandInfo {
+  return {
+    id: file.id,
+    title: file.name,
+    subtitle: file.location,
+    iconDataUrl: file.iconDataUrl,
+    category: 'file',
+    path: file.path,
+  };
+}
+
 function fileBasename(filePath: string): string {
   const normalized = filePath.replace(/\/$/, '');
   const idx = normalized.lastIndexOf('/');
@@ -176,6 +210,9 @@ const App: React.FC = () => {
   // Inline file search state
   const [fileResults, setFileResults] = useState<InlineFileResult[]>([]);
   const [fileIcons, setFileIcons] = useState<Record<string, string>>({});
+
+  // Resolved pinned file items (from file: IDs in pinnedCommands)
+  const [pinnedFiles, setPinnedFiles] = useState<Map<string, PinnedFileItem>>(new Map());
   const fileSearchSeqRef = useRef(0);
   const memoryFeedbackTimerRef = useRef<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -345,6 +382,36 @@ const App: React.FC = () => {
     fetchCommands();
     loadLauncherPreferences();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Resolve pinned file entries whenever pinnedCommands changes
+  useEffect(() => {
+    const fileIds = pinnedCommands.filter(isPinnedFileId);
+    if (fileIds.length === 0) {
+      setPinnedFiles(new Map());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const entries: [string, PinnedFileItem][] = [];
+      for (const id of fileIds) {
+        const filePath = pinnedFileIdToPath(id);
+        try {
+          const exists = await window.electron.fileExists(filePath);
+          if (!exists) continue;
+          const name = fileBasename(filePath);
+          const location = getFileLocation(filePath);
+          const iconDataUrl = await window.electron.getFileIconDataUrl(filePath, 20) || undefined;
+          entries.push([id, { id, path: filePath, name, location, iconDataUrl }]);
+        } catch {
+          // Skip files that can't be resolved
+        }
+      }
+      if (!cancelled) {
+        setPinnedFiles(new Map(entries));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [pinnedCommands]);
 
   useEffect(() => {
     const cleanupWindowHidden = window.electron.onWindowHidden(() => {
@@ -659,6 +726,19 @@ const App: React.FC = () => {
     [updatePinnedCommands]
   );
 
+  const pinToggleForFile = useCallback(
+    async (filePath: string) => {
+      const fileId = pathToPinnedFileId(filePath);
+      const currentPinned = pinnedCommandsRef.current;
+      if (currentPinned.includes(fileId)) {
+        await updatePinnedCommands(currentPinned.filter((id) => id !== fileId));
+      } else {
+        await updatePinnedCommands([fileId, ...currentPinned]);
+      }
+    },
+    [updatePinnedCommands]
+  );
+
   const disableCommand = useCallback(
     async (command: CommandInfo) => {
       await window.electron.toggleCommandEnabled(command.id, false);
@@ -711,6 +791,70 @@ const App: React.FC = () => {
     },
     [pinnedCommands, updatePinnedCommands]
   );
+
+  // ─── Drag-to-reorder pinned items ──────────────────────────────────
+  const [dragState, setDragState] = useState<{
+    draggedId: string;
+    dropTargetId: string | null;
+    dropPosition: 'before' | 'after' | null;
+  } | null>(null);
+
+  const handlePinnedDragStart = useCallback(
+    (e: React.DragEvent<HTMLDivElement>, commandId: string) => {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', commandId);
+      requestAnimationFrame(() => {
+        setDragState({ draggedId: commandId, dropTargetId: null, dropPosition: null });
+      });
+    },
+    []
+  );
+
+  const handlePinnedDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>, commandId: string) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const rect = e.currentTarget.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      const position: 'before' | 'after' = e.clientY < midY ? 'before' : 'after';
+      setDragState((prev) =>
+        prev ? { ...prev, dropTargetId: commandId, dropPosition: position } : null
+      );
+    },
+    []
+  );
+
+  const handlePinnedDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const ds = dragState;
+      if (!ds?.draggedId || !ds.dropTargetId || ds.draggedId === ds.dropTargetId) {
+        setDragState(null);
+        return;
+      }
+      // Map display IDs back to pinned array IDs
+      const fromIdx = pinnedCommands.indexOf(ds.draggedId);
+      let toIdx = pinnedCommands.indexOf(ds.dropTargetId);
+      if (fromIdx === -1 || toIdx === -1) {
+        setDragState(null);
+        return;
+      }
+      if (ds.dropPosition === 'after') toIdx += 1;
+      if (fromIdx < toIdx) toIdx -= 1;
+      if (fromIdx !== toIdx) {
+        const next = [...pinnedCommands];
+        const [item] = next.splice(fromIdx, 1);
+        next.splice(toIdx, 0, item);
+        await updatePinnedCommands(next);
+      }
+      setDragState(null);
+    },
+    [dragState, pinnedCommands, updatePinnedCommands]
+  );
+
+  const handlePinnedDragEnd = useCallback(() => {
+    setDragState(null);
+  }, []);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -935,9 +1079,25 @@ const App: React.FC = () => {
       : [];
     const contextualIds = new Set(contextual.map((c) => c.id));
 
+    const lowerQuery = searchQuery.toLowerCase().trim();
+
     const pinned = pinnedCommands
-      .map((id) => sourceMap.get(id))
-      .filter((cmd): cmd is CommandInfo => Boolean(cmd) && !contextualIds.has((cmd as CommandInfo).id));
+      .map((id): CommandInfo | null => {
+        if (isPinnedFileId(id)) {
+          const fileItem = pinnedFiles.get(id);
+          if (!fileItem) return null;
+          // When searching, filter pinned files that don't match
+          if (lowerQuery) {
+            const lowerName = fileItem.name.toLowerCase();
+            if (!lowerName.includes(lowerQuery)) return null;
+          }
+          return pinnedFileToCommandInfo(fileItem);
+        }
+        const cmd = sourceMap.get(id);
+        if (!cmd || contextualIds.has(id)) return null;
+        return cmd;
+      })
+      .filter((cmd): cmd is CommandInfo => cmd !== null);
     const pinnedSet = new Set(pinned.map((c) => c.id));
 
     const recent = recentCommands
@@ -955,7 +1115,7 @@ const App: React.FC = () => {
     );
 
     return { contextual, pinned, recent, other };
-  }, [sourceCommands, pinnedCommands, recentCommands, selectedTextSnapshot]);
+  }, [sourceCommands, pinnedCommands, pinnedFiles, recentCommands, selectedTextSnapshot, searchQuery]);
 
   const displayCommands = useMemo(
     () => [
@@ -967,9 +1127,15 @@ const App: React.FC = () => {
     [groupedCommands]
   );
 
+  // Filter out already-pinned files from inline results to avoid duplication
+  const unpinnedFileResults = useMemo(
+    () => fileResults.filter((f) => !pinnedCommands.includes(pathToPinnedFileId(f.path))),
+    [fileResults, pinnedCommands]
+  );
+
   useEffect(() => {
-    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset + fileResults.length);
-  }, [displayCommands.length, calcOffset, fileResults.length]);
+    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset + unpinnedFileResults.length);
+  }, [displayCommands.length, calcOffset, unpinnedFileResults.length]);
 
   const scrollToSelected = useCallback(() => {
     const selectedElement = itemRefs.current[selectedIndex];
@@ -996,9 +1162,9 @@ const App: React.FC = () => {
   }, [searchQuery]);
 
   useEffect(() => {
-    const max = Math.max(0, displayCommands.length + calcOffset + fileResults.length - 1);
+    const max = Math.max(0, displayCommands.length + calcOffset + unpinnedFileResults.length - 1);
     setSelectedIndex((prev) => (prev > max ? max : prev));
-  }, [displayCommands.length, calcOffset, fileResults.length]);
+  }, [displayCommands.length, calcOffset, unpinnedFileResults.length]);
 
   const selectedCommand =
     selectedIndex >= calcOffset && selectedIndex < calcOffset + displayCommands.length
@@ -1007,7 +1173,7 @@ const App: React.FC = () => {
 
   const selectedFile =
     selectedIndex >= calcOffset + displayCommands.length
-      ? fileResults[selectedIndex - calcOffset - displayCommands.length] || null
+      ? unpinnedFileResults[selectedIndex - calcOffset - displayCommands.length] || null
       : null;
 
   const openFileResult = useCallback(async (filePath: string) => {
@@ -1022,9 +1188,16 @@ const App: React.FC = () => {
   }, []);
 
   const togglePinSelectedCommand = useCallback(async () => {
-    if (!selectedCommand) return;
-    await pinToggleForCommand(selectedCommand);
-  }, [selectedCommand, pinToggleForCommand]);
+    if (selectedCommand) {
+      if (selectedCommand.category === 'file') {
+        await pinToggleForFile(pinnedFileIdToPath(selectedCommand.id));
+      } else {
+        await pinToggleForCommand(selectedCommand);
+      }
+    } else if (selectedFile) {
+      await pinToggleForFile(selectedFile.path);
+    }
+  }, [selectedCommand, selectedFile, pinToggleForCommand, pinToggleForFile]);
 
   const disableSelectedCommand = useCallback(async () => {
     if (!selectedCommand) return;
@@ -1100,7 +1273,7 @@ const App: React.FC = () => {
         case 'ArrowDown':
           e.preventDefault();
           setSelectedIndex((prev) => {
-            const max = displayCommands.length + calcOffset + fileResults.length - 1;
+            const max = displayCommands.length + calcOffset + unpinnedFileResults.length - 1;
             return prev < max ? prev + 1 : prev;
           });
           break;
@@ -1120,7 +1293,7 @@ const App: React.FC = () => {
           } else {
             // File result selected
             const fileIdx = selectedIndex - calcOffset - displayCommands.length;
-            const file = fileResults[fileIdx];
+            const file = unpinnedFileResults[fileIdx];
             if (file) {
               openFileResult(file.path);
             }
@@ -1151,7 +1324,7 @@ const App: React.FC = () => {
       startAiChat,
       calcResult,
       calcOffset,
-      fileResults,
+      unpinnedFileResults,
       openFileResult,
       togglePinSelectedCommand,
       disableSelectedCommand,
@@ -1338,6 +1511,12 @@ const App: React.FC = () => {
 
   const handleCommandExecute = async (command: CommandInfo) => {
     try {
+      // Pinned file — open directly
+      if (command.category === 'file' && command.path) {
+        await openFileResult(command.path);
+        return;
+      }
+
       if (await runLocalSystemCommand(command.id)) {
         await updateRecentCommands(command.id);
         return;
@@ -1429,6 +1608,43 @@ const App: React.FC = () => {
   const getActionsForCommand = useCallback(
     (command: CommandInfo | null): LauncherAction[] => {
       if (!command) return [];
+
+      // File items get a simpler action set
+      if (command.category === 'file') {
+        const filePath = command.path || pinnedFileIdToPath(command.id);
+        const isPinned = pinnedCommands.includes(isPinnedFileId(command.id) ? command.id : pathToPinnedFileId(filePath));
+        const pinnedId = isPinnedFileId(command.id) ? command.id : pathToPinnedFileId(filePath);
+        const pinnedIndex = pinnedCommands.indexOf(pinnedId);
+        return [
+          {
+            id: 'open',
+            title: 'Open File',
+            shortcut: 'Enter',
+            execute: () => openFileResult(filePath),
+          },
+          {
+            id: 'pin',
+            title: isPinned ? 'Unpin File' : 'Pin File',
+            shortcut: 'Cmd+Shift+P',
+            execute: () => pinToggleForFile(filePath),
+          },
+          {
+            id: 'move-up',
+            title: 'Move Up',
+            shortcut: 'Cmd+Alt+Up',
+            enabled: isPinned && pinnedIndex > 0,
+            execute: () => movePinnedCommand(command, 'up'),
+          },
+          {
+            id: 'move-down',
+            title: 'Move Down',
+            shortcut: 'Cmd+Alt+Down',
+            enabled: isPinned && pinnedIndex >= 0 && pinnedIndex < pinnedCommands.length - 1,
+            execute: () => movePinnedCommand(command, 'down'),
+          },
+        ].filter((action) => action.enabled !== false);
+      }
+
       const isPinned = pinnedCommands.includes(command.id);
       const pinnedIndex = pinnedCommands.indexOf(command.id);
       return [
@@ -1482,24 +1698,57 @@ const App: React.FC = () => {
       pinnedCommands,
       handleCommandExecute,
       pinToggleForCommand,
+      pinToggleForFile,
+      openFileResult,
       disableCommand,
       uninstallExtensionCommand,
       movePinnedCommand,
     ]
   );
 
-  const selectedActions = useMemo(
-    () => getActionsForCommand(selectedCommand),
-    [getActionsForCommand, selectedCommand]
-  );
+  const selectedActions = useMemo(() => {
+    if (selectedCommand) return getActionsForCommand(selectedCommand);
+    // When a file result is selected, build a synthetic CommandInfo for actions
+    if (selectedFile) {
+      const syntheticCmd: CommandInfo = {
+        id: pathToPinnedFileId(selectedFile.path),
+        title: selectedFile.name,
+        subtitle: selectedFile.location,
+        iconDataUrl: fileIcons[selectedFile.path],
+        category: 'file',
+        path: selectedFile.path,
+      };
+      return getActionsForCommand(syntheticCmd);
+    }
+    return [];
+  }, [getActionsForCommand, selectedCommand, selectedFile, fileIcons]);
 
-  const contextCommand = useMemo(
-    () =>
-      contextMenu
-        ? displayCommands.find((cmd) => cmd.id === contextMenu.commandId) || null
-        : null,
-    [contextMenu, displayCommands]
-  );
+  const contextCommand = useMemo(() => {
+    if (!contextMenu) return null;
+    const cmdId = contextMenu.commandId;
+
+    // Check display commands first (includes pinned files already converted to CommandInfo)
+    const found = displayCommands.find((cmd) => cmd.id === cmdId);
+    if (found) return found;
+
+    // Handle file IDs from inline file results (not yet pinned)
+    if (isPinnedFileId(cmdId)) {
+      const filePath = pinnedFileIdToPath(cmdId);
+      const inlineResult = fileResults.find((f) => f.path === filePath);
+      if (inlineResult) {
+        return {
+          id: cmdId,
+          title: inlineResult.name,
+          subtitle: inlineResult.location,
+          iconDataUrl: fileIcons[inlineResult.path],
+          category: 'file' as const,
+          path: filePath,
+        };
+      }
+    }
+
+    return null;
+  }, [contextMenu, displayCommands, fileResults, fileIcons]);
 
   const contextActions = useMemo(
     () => getActionsForCommand(contextCommand),
@@ -1989,7 +2238,7 @@ const App: React.FC = () => {
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">Discovering apps...</p>
             </div>
-          ) : displayCommands.length === 0 && fileResults.length === 0 && !calcResult ? (
+          ) : displayCommands.length === 0 && unpinnedFileResults.length === 0 && !calcResult ? (
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">No matching results</p>
             </div>
@@ -2047,15 +2296,23 @@ const App: React.FC = () => {
                       const flatIndex = startIndex + i;
                       const accessoryLabel = getCommandAccessoryLabel(command);
                       const fallbackCategory = getCategoryLabel(command.category);
+                      const isPinnedSection = section.title === 'Pinned';
+                      const isDragging = dragState?.draggedId === command.id;
+                      const isDropTarget = dragState?.dropTargetId === command.id && dragState.draggedId !== command.id;
                       acc.nodes.push(
                         <div
                           key={command.id}
                           ref={(el) => (itemRefs.current[flatIndex + calcOffset] = el)}
-                          className={`command-item px-3 py-2 rounded-lg cursor-pointer ${
+                          className={`command-item px-3 py-2 rounded-lg cursor-pointer relative ${
                             flatIndex + calcOffset === selectedIndex ? 'selected' : ''
-                          }`}
+                          } ${isDragging ? 'opacity-40' : ''} ${isPinnedSection ? 'group' : ''}`}
+                          draggable={isPinnedSection}
+                          onDragStart={isPinnedSection ? (e) => handlePinnedDragStart(e, command.id) : undefined}
+                          onDragOver={isPinnedSection ? (e) => handlePinnedDragOver(e, command.id) : undefined}
+                          onDrop={isPinnedSection ? handlePinnedDrop : undefined}
+                          onDragEnd={isPinnedSection ? handlePinnedDragEnd : undefined}
                           onClick={() => handleCommandExecute(command)}
-                          onMouseMove={() => setSelectedIndex(flatIndex + calcOffset)}
+                          onMouseMove={() => { if (!dragState) setSelectedIndex(flatIndex + calcOffset); }}
                           onContextMenu={(e) => {
                             e.preventDefault();
                             setSelectedIndex(flatIndex + calcOffset);
@@ -2067,7 +2324,19 @@ const App: React.FC = () => {
                             });
                           }}
                         >
+                          {isDropTarget && dragState?.dropPosition === 'before' && (
+                            <div className="absolute left-2 right-2 -top-[1px] h-[2px] bg-blue-400 rounded-full pointer-events-none" />
+                          )}
                           <div className="flex items-center gap-2.5">
+                            {isPinnedSection && (
+                              <div className="drag-handle w-3 flex items-center justify-center flex-shrink-0 cursor-grab">
+                                <svg width="6" height="10" viewBox="0 0 6 10" fill="currentColor" className="text-white/40">
+                                  <circle cx="1.5" cy="1.5" r="1" /><circle cx="4.5" cy="1.5" r="1" />
+                                  <circle cx="1.5" cy="5" r="1" /><circle cx="4.5" cy="5" r="1" />
+                                  <circle cx="1.5" cy="8.5" r="1" /><circle cx="4.5" cy="8.5" r="1" />
+                                </svg>
+                              </div>
+                            )}
                             <div className="w-5 h-5 flex items-center justify-center flex-shrink-0 overflow-hidden">
                               {renderCommandIcon(command)}
                             </div>
@@ -2087,6 +2356,9 @@ const App: React.FC = () => {
                               )}
                             </div>
                           </div>
+                          {isDropTarget && dragState?.dropPosition === 'after' && (
+                            <div className="absolute left-2 right-2 -bottom-[1px] h-[2px] bg-blue-400 rounded-full pointer-events-none" />
+                          )}
                         </div>
                       );
                     });
@@ -2096,13 +2368,13 @@ const App: React.FC = () => {
                   { nodes: [] as React.ReactNode[], index: 0 }
                 ).nodes}
 
-              {/* Inline file search results */}
-              {fileResults.length > 0 && (
+              {/* Inline file search results (excluding already-pinned files) */}
+              {unpinnedFileResults.length > 0 && (
                 <>
                   <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-white/50 font-semibold">
                     Files
                   </div>
-                  {fileResults.map((file, i) => {
+                  {unpinnedFileResults.map((file, i) => {
                     const flatIndex = displayCommands.length + calcOffset + i;
                     const icon = fileIcons[file.path];
                     return (
@@ -2114,6 +2386,16 @@ const App: React.FC = () => {
                         }`}
                         onClick={() => openFileResult(file.path)}
                         onMouseMove={() => setSelectedIndex(flatIndex)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          setSelectedIndex(flatIndex);
+                          setShowActions(false);
+                          setContextMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            commandId: pathToPinnedFileId(file.path),
+                          });
+                        }}
                       >
                         <div className="flex items-center gap-2.5">
                           <div className="w-5 h-5 flex items-center justify-center flex-shrink-0 overflow-hidden">
