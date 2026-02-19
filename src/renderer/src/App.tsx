@@ -755,13 +755,19 @@ const App: React.FC = () => {
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir as string || '';
-        const terms = trimmed.split(/\s+/).filter(Boolean);
-        const spotQuery = terms
-          .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
-          .join(' && ');
-        const args = homeDir ? ['-onlyin', homeDir, spotQuery] : [spotQuery];
-        const res = await window.electron.execCommand('mdfind', args);
-        const files = (res.stdout || '').split('\n').filter(Boolean).slice(0, 5);
+        // Use mdfind -name for reliable substring filename matching.
+        // -onlyin homeDir keeps results user-relevant and fast.
+        const args: string[] = [];
+        if (homeDir) args.push('-onlyin', homeDir);
+        args.push('-name', trimmed);
+        const res = await window.electron.execCommand('/usr/bin/mdfind', args);
+        const files = (res.stdout || '')
+          .split('\n')
+          .filter(Boolean)
+          // Skip hidden files/dirs and system paths
+          .filter((f) => !f.split('/').some((part) => part.startsWith('.')))
+          .filter((f) => !f.startsWith('/System') && !f.startsWith('/private/var'))
+          .slice(0, 8);
         setInlineFileResults(files);
       } catch {
         setInlineFileResults([]);
