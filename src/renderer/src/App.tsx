@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Sparkles, ArrowRight, Loader2 } from 'lucide-react';
+import { X, Sparkles, ArrowRight, Loader2, File as FileIcon } from 'lucide-react';
 import type { CommandInfo, ExtensionBundle, AppSettings } from '../types/electron';
 import ExtensionView from './ExtensionView';
 import ClipboardManager from './ClipboardManager';
@@ -48,6 +48,50 @@ import AiChatView from './views/AiChatView';
 import CursorPromptView from './views/CursorPromptView';
 
 const STALE_OVERLAY_RESET_MS = 60_000;
+
+// ─── Inline file search helpers ──────────────────────────────────────
+interface InlineFileResult {
+  path: string;
+  name: string;
+  dir: string;
+}
+
+function fileBasename(filePath: string): string {
+  const normalized = filePath.replace(/\/$/, '');
+  const idx = normalized.lastIndexOf('/');
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized;
+}
+
+function fileDirname(filePath: string): string {
+  const normalized = filePath.replace(/\/$/, '');
+  const idx = normalized.lastIndexOf('/');
+  return idx > 0 ? normalized.slice(0, idx) : '/';
+}
+
+function asTildePath(filePath: string): string {
+  const home = (window.electron as any).homeDir || '';
+  if (home && filePath.startsWith(home)) {
+    return '~' + (filePath.slice(home.length) || '/');
+  }
+  return filePath;
+}
+
+function buildInlineSpotlightQuery(rawQuery: string): string {
+  const terms = rawQuery
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (terms.length === 0) return 'kMDItemFSName == "*"cd';
+  return terms
+    .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
+    .join(' && ');
+}
+
+function matchesAllTerms(fileName: string, terms: string[]): boolean {
+  const lower = fileName.toLowerCase();
+  return terms.every((t) => lower.includes(t));
+}
+// ─────────────────────────────────────────────────────────────────────
 
 const App: React.FC = () => {
   const [commands, setCommands] = useState<CommandInfo[]>([]);
@@ -106,6 +150,11 @@ const App: React.FC = () => {
   const [selectedTextSnapshot, setSelectedTextSnapshot] = useState('');
   const [memoryFeedback, setMemoryFeedback] = useState<MemoryFeedback>(null);
   const [memoryActionLoading, setMemoryActionLoading] = useState(false);
+
+  // Inline file search state
+  const [fileResults, setFileResults] = useState<InlineFileResult[]>([]);
+  const [fileIcons, setFileIcons] = useState<Record<string, string>>({});
+  const fileSearchSeqRef = useRef(0);
   const memoryFeedbackTimerRef = useRef<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const commandsRef = useRef<CommandInfo[]>([]);
@@ -744,6 +793,79 @@ const App: React.FC = () => {
   }, [searchQuery, syncCalcResult]);
   const calcResult = syncCalcResult ?? asyncCalcResult;
   const calcOffset = calcResult ? 1 : 0;
+
+  // ─── Inline file search via Spotlight ────────────────────────────
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    fileSearchSeqRef.current += 1;
+    const requestId = fileSearchSeqRef.current;
+
+    if (!trimmed || trimmed.length < 2) {
+      setFileResults([]);
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const homeDir = (window.electron as any).homeDir || '/';
+        const spotlightQuery = buildInlineSpotlightQuery(trimmed);
+        const response = await window.electron.execCommand('mdfind', [
+          '-onlyin', homeDir, spotlightQuery,
+        ]);
+
+        if (fileSearchSeqRef.current !== requestId) return;
+
+        const lowerTerms = trimmed
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(Boolean);
+
+        const paths = response.stdout
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .filter((p) => matchesAllTerms(fileBasename(p), lowerTerms))
+          .slice(0, 5);
+
+        const results: InlineFileResult[] = paths.map((p) => ({
+          path: p,
+          name: fileBasename(p),
+          dir: fileDirname(p),
+        }));
+
+        setFileResults(results);
+
+        // Load file icons for the results
+        const iconEntries = await Promise.all(
+          results.map(async (file) => {
+            try {
+              const dataUrl = await window.electron.getFileIconDataUrl(file.path, 20);
+              return [file.path, dataUrl || ''] as const;
+            } catch {
+              return [file.path, ''] as const;
+            }
+          }),
+        );
+
+        if (fileSearchSeqRef.current !== requestId) return;
+        setFileIcons((prev) => {
+          const next = { ...prev };
+          for (const [path, icon] of iconEntries) {
+            if (icon) next[path] = icon;
+          }
+          return next;
+        });
+      } catch (error) {
+        console.error('Inline file search failed:', error);
+        if (fileSearchSeqRef.current === requestId) {
+          setFileResults([]);
+        }
+      }
+    }, 150);
+
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
   const contextualCommands = commands;
   const filteredCommands = useMemo(
     () => filterCommands(contextualCommands, searchQuery),
@@ -795,8 +917,8 @@ const App: React.FC = () => {
   );
 
   useEffect(() => {
-    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset);
-  }, [displayCommands.length, calcOffset]);
+    itemRefs.current = itemRefs.current.slice(0, displayCommands.length + calcOffset + fileResults.length);
+  }, [displayCommands.length, calcOffset, fileResults.length]);
 
   const scrollToSelected = useCallback(() => {
     const selectedElement = itemRefs.current[selectedIndex];
@@ -823,14 +945,30 @@ const App: React.FC = () => {
   }, [searchQuery]);
 
   useEffect(() => {
-    const max = Math.max(0, displayCommands.length + calcOffset - 1);
+    const max = Math.max(0, displayCommands.length + calcOffset + fileResults.length - 1);
     setSelectedIndex((prev) => (prev > max ? max : prev));
-  }, [displayCommands.length, calcOffset]);
+  }, [displayCommands.length, calcOffset, fileResults.length]);
 
   const selectedCommand =
-    selectedIndex >= calcOffset
+    selectedIndex >= calcOffset && selectedIndex < calcOffset + displayCommands.length
       ? displayCommands[selectedIndex - calcOffset]
       : null;
+
+  const selectedFile =
+    selectedIndex >= calcOffset + displayCommands.length
+      ? fileResults[selectedIndex - calcOffset - displayCommands.length] || null
+      : null;
+
+  const openFileResult = useCallback(async (filePath: string) => {
+    try {
+      await window.electron.execCommand('open', [filePath]);
+      await window.electron.hideWindow();
+      setSearchQuery('');
+      setSelectedIndex(0);
+    } catch (error) {
+      console.error('Failed to open file:', error);
+    }
+  }, []);
 
   const togglePinSelectedCommand = useCallback(async () => {
     if (!selectedCommand) return;
@@ -911,7 +1049,7 @@ const App: React.FC = () => {
         case 'ArrowDown':
           e.preventDefault();
           setSelectedIndex((prev) => {
-            const max = displayCommands.length + calcOffset - 1;
+            const max = displayCommands.length + calcOffset + fileResults.length - 1;
             return prev < max ? prev + 1 : prev;
           });
           break;
@@ -926,8 +1064,15 @@ const App: React.FC = () => {
           if (calcResult && selectedIndex === 0) {
             navigator.clipboard.writeText(calcResult.result);
             window.electron.hideWindow();
-          } else if (displayCommands[selectedIndex - calcOffset]) {
+          } else if (selectedIndex < calcOffset + displayCommands.length && displayCommands[selectedIndex - calcOffset]) {
             handleCommandExecute(displayCommands[selectedIndex - calcOffset]);
+          } else {
+            // File result selected
+            const fileIdx = selectedIndex - calcOffset - displayCommands.length;
+            const file = fileResults[fileIdx];
+            if (file) {
+              openFileResult(file.path);
+            }
           }
           break;
 
@@ -955,6 +1100,8 @@ const App: React.FC = () => {
       startAiChat,
       calcResult,
       calcOffset,
+      fileResults,
+      openFileResult,
       togglePinSelectedCommand,
       disableSelectedCommand,
       uninstallSelectedExtension,
@@ -1755,7 +1902,7 @@ const App: React.FC = () => {
           <input
             ref={inputRef}
             type="text"
-            placeholder="Search apps and settings..."
+            placeholder="Search apps, files, and settings..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -1791,7 +1938,7 @@ const App: React.FC = () => {
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">Discovering apps...</p>
             </div>
-          ) : displayCommands.length === 0 && !calcResult ? (
+          ) : displayCommands.length === 0 && fileResults.length === 0 && !calcResult ? (
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">No matching results</p>
             </div>
@@ -1897,6 +2044,50 @@ const App: React.FC = () => {
                   },
                   { nodes: [] as React.ReactNode[], index: 0 }
                 ).nodes}
+
+              {/* Inline file search results */}
+              {fileResults.length > 0 && (
+                <>
+                  <div className="px-3 pt-2 pb-1 text-[11px] uppercase tracking-wider text-white/50 font-semibold">
+                    Files
+                  </div>
+                  {fileResults.map((file, i) => {
+                    const flatIndex = displayCommands.length + calcOffset + i;
+                    const icon = fileIcons[file.path];
+                    return (
+                      <div
+                        key={`file-${file.path}`}
+                        ref={(el) => (itemRefs.current[flatIndex] = el)}
+                        className={`command-item px-3 py-2 rounded-lg cursor-pointer ${
+                          flatIndex === selectedIndex ? 'selected' : ''
+                        }`}
+                        onClick={() => openFileResult(file.path)}
+                        onMouseMove={() => setSelectedIndex(flatIndex)}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-5 h-5 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                            {icon ? (
+                              <img src={icon} alt="" className="w-5 h-5 object-contain" draggable={false} />
+                            ) : (
+                              <div className="w-5 h-5 rounded bg-blue-500/20 flex items-center justify-center">
+                                <FileIcon className="w-3 h-3 text-blue-300" />
+                              </div>
+                            )}
+                          </div>
+                          <div className="min-w-0 flex-1 flex items-center gap-2">
+                            <div className="text-white/95 text-[13px] font-semibold truncate tracking-[0.004em]">
+                              {file.name}
+                            </div>
+                            <div className="text-white/50 text-[11px] font-medium truncate">
+                              {asTildePath(file.dir)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
             </div>
           )}
         </div>
@@ -1925,18 +2116,43 @@ const App: React.FC = () => {
                 </>
               ) : memoryFeedback
                 ? memoryFeedback.text
-                : selectedCommand
+                : selectedFile
                   ? (
                     <>
                       <span className="w-5 h-5 flex items-center justify-center flex-shrink-0 overflow-hidden">
-                        {renderCommandIcon(selectedCommand)}
+                        {fileIcons[selectedFile.path] ? (
+                          <img src={fileIcons[selectedFile.path]} alt="" className="w-5 h-5 object-contain" draggable={false} />
+                        ) : (
+                          <FileIcon className="w-3.5 h-3.5 text-blue-300" />
+                        )}
                       </span>
-                      <span className="truncate">{getCommandDisplayTitle(selectedCommand)}</span>
+                      <span className="truncate">{selectedFile.name}</span>
                     </>
                   )
-                  : `${displayCommands.length} results`}
+                  : selectedCommand
+                    ? (
+                      <>
+                        <span className="w-5 h-5 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                          {renderCommandIcon(selectedCommand)}
+                        </span>
+                        <span className="truncate">{getCommandDisplayTitle(selectedCommand)}</span>
+                      </>
+                    )
+                    : `${displayCommands.length} results`}
             </div>
-            {selectedActions[0] && (
+            {selectedFile ? (
+              <div className="flex items-center gap-2 mr-3">
+                <button
+                  onClick={() => openFileResult(selectedFile.path)}
+                  className="text-white text-xs font-semibold hover:text-white/85 transition-colors"
+                >
+                  Open
+                </button>
+                <kbd className="inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 rounded bg-white/[0.08] text-[11px] text-white/40 font-medium">
+                  ↩
+                </kbd>
+              </div>
+            ) : selectedActions[0] ? (
               <div className="flex items-center gap-2 mr-3">
                 <button
                   onClick={() => selectedActions[0].execute()}
@@ -1950,7 +2166,7 @@ const App: React.FC = () => {
                   </kbd>
                 )}
               </div>
-            )}
+            ) : null}
             <button
               onClick={() => {
                 setContextMenu(null);

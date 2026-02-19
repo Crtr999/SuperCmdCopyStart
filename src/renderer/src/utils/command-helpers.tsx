@@ -37,7 +37,54 @@ export type ReadVoiceOption = {
 };
 
 /**
- * Filter and sort commands based on search query
+ * Fuzzy match scoring: returns > 0 if all query chars appear in order in target.
+ * Higher score = better match. Returns 0 if not all characters match.
+ */
+export function fuzzyScore(query: string, target: string): number {
+  const q = query.toLowerCase();
+  const t = target.toLowerCase();
+  if (q.length === 0) return 0;
+  if (q.length > t.length) return 0;
+
+  let qIdx = 0;
+  let score = 0;
+  let prevMatchIdx = -2;
+
+  for (let tIdx = 0; tIdx < t.length && qIdx < q.length; tIdx++) {
+    if (t[tIdx] === q[qIdx]) {
+      qIdx++;
+      score += 1;
+      // Consecutive character bonus
+      if (tIdx === prevMatchIdx + 1) {
+        score += 3;
+      }
+      // Word boundary bonus (start of string, after separator, or CamelCase)
+      const isWordStart =
+        tIdx === 0 ||
+        /[\s\-_./\\]/.test(target[tIdx - 1]) ||
+        (tIdx > 0 &&
+          target[tIdx] === target[tIdx].toUpperCase() &&
+          target[tIdx - 1] === target[tIdx - 1].toLowerCase() &&
+          /[a-zA-Z]/.test(target[tIdx]));
+      if (isWordStart) {
+        score += 5;
+      }
+      prevMatchIdx = tIdx;
+    }
+  }
+
+  // All query characters must be matched
+  if (qIdx < q.length) return 0;
+
+  // Bonus for tighter matches (shorter targets)
+  score += Math.max(0, 10 - Math.abs(t.length - q.length));
+
+  return score;
+}
+
+/**
+ * Filter and sort commands based on search query.
+ * Uses substring matching first, then falls back to fuzzy matching.
  */
 export function filterCommands(commands: CommandInfo[], query: string): CommandInfo[] {
   if (!query.trim()) {
@@ -77,6 +124,29 @@ export function filterCommands(commands: CommandInfo[], query: string): CommandI
       // Subtitle match
       else if (lowerSubtitle.includes(lowerQuery)) {
         score = 22;
+      }
+      // Fuzzy match on title
+      else {
+        const titleFuzzy = fuzzyScore(lowerQuery, lowerTitle);
+        if (titleFuzzy > 0) {
+          score = Math.min(titleFuzzy, 20);
+        } else {
+          // Fuzzy match on keywords
+          for (const k of keywords) {
+            const kFuzzy = fuzzyScore(lowerQuery, k);
+            if (kFuzzy > 0) {
+              score = Math.min(kFuzzy, 15);
+              break;
+            }
+          }
+          // Fuzzy match on subtitle
+          if (score === 0) {
+            const subtitleFuzzy = fuzzyScore(lowerQuery, lowerSubtitle);
+            if (subtitleFuzzy > 0) {
+              score = Math.min(subtitleFuzzy, 10);
+            }
+          }
+        }
       }
 
       return { cmd, score };
