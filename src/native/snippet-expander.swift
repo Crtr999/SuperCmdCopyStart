@@ -24,8 +24,8 @@ let keywords = Set(parsed.map { $0.lowercased() })
 let sortedKeywords = Array(keywords).sorted { $0.count > $1.count }
 let maxKeywordLength = max(sortedKeywords.first?.count ?? 1, 1)
 
-let allowedChars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-let delimiters = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,!?;:()[]{}<>/\\|@#$%^&*+=`~\"'"))
+let allowedChars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_@#"))
+let delimiters = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,!?;:()[]{}<>/\\|$%^&*+=`~\"'"))
 
 var currentToken = ""
 

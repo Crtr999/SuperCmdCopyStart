@@ -3529,10 +3529,20 @@ function refreshSnippetExpander(): void {
 
   const expanderPath = getNativeBinaryPath('snippet-expander');
   const fs = require('fs');
-  if (!fs.existsSync(expanderPath)) {
+  const sourcePath = path.join(app.getAppPath(), 'src', 'native', 'snippet-expander.swift');
+  // Recompile if binary is missing or source is newer than binary
+  let needsCompile = !fs.existsSync(expanderPath);
+  if (!needsCompile && fs.existsSync(sourcePath)) {
+    try {
+      const srcMtime = fs.statSync(sourcePath).mtimeMs;
+      const binMtime = fs.statSync(expanderPath).mtimeMs;
+      if (srcMtime > binMtime) needsCompile = true;
+    } catch {}
+  }
+  if (needsCompile) {
     try {
       const { execFileSync } = require('child_process');
-      const sourcePath = path.join(app.getAppPath(), 'src', 'native', 'snippet-expander.swift');
+      fs.mkdirSync(path.dirname(expanderPath), { recursive: true });
       execFileSync('swiftc', ['-O', '-o', expanderPath, sourcePath, '-framework', 'AppKit']);
     } catch (error) {
       console.warn('[SnippetExpander] Native helper not found and compile failed:', error);
