@@ -1684,6 +1684,7 @@ const App: React.FC = () => {
         <div className="w-full h-full">
           <div className="glass-effect overflow-hidden h-full flex flex-col">
             <FileSearchExtension
+              initialQuery={searchQuery}
               onClose={() => {
                 setShowFileSearch(false);
                 setSearchQuery('');

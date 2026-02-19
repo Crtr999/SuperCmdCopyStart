@@ -4,6 +4,7 @@ import ExtensionActionFooter from './components/ExtensionActionFooter';
 
 interface FileSearchExtensionProps {
   onClose: () => void;
+  initialQuery?: string;
 }
 
 interface SearchScope {
@@ -123,8 +124,8 @@ function matchesFileNameTerms(filePath: string, terms: string[]): boolean {
   });
 }
 
-const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose }) => {
-  const [query, setQuery] = useState('');
+const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose, initialQuery }) => {
+  const [query, setQuery] = useState(initialQuery || '');
   const [scopes, setScopes] = useState<SearchScope[]>([]);
   const [scopeId, setScopeId] = useState('home');
   const [results, setResults] = useState<string[]>([]);
@@ -144,7 +145,13 @@ const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose }) =>
   useEffect(() => {
     const homeDir = (window.electron as any).homeDir || '';
     const username = homeDir ? basename(homeDir) || 'User' : 'User';
-    setScopes([{ id: 'home', label: `User (${username})`, path: homeDir || '/' }]);
+    setScopes([
+      { id: 'home', label: `Home (${username})`, path: homeDir || '/' },
+      { id: 'desktop', label: 'Desktop', path: homeDir ? `${homeDir}/Desktop` : '/Desktop' },
+      { id: 'documents', label: 'Documents', path: homeDir ? `${homeDir}/Documents` : '/Documents' },
+      { id: 'downloads', label: 'Downloads', path: homeDir ? `${homeDir}/Downloads` : '/Downloads' },
+      { id: 'all', label: 'All Files', path: '' },
+    ]);
     setScopeId('home');
     inputRef.current?.focus();
   }, []);
@@ -209,7 +216,10 @@ const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose }) =>
       setIsLoading(true);
       try {
         const spotlightQuery = buildNameOnlySpotlightQuery(trimmed);
-        const response = await window.electron.execCommand('mdfind', ['-onlyin', currentScope.path, spotlightQuery]);
+        const mdfindArgs = currentScope.path
+          ? ['-onlyin', currentScope.path, spotlightQuery]
+          : [spotlightQuery];
+        const response = await window.electron.execCommand('mdfind', mdfindArgs);
         if (searchRequestRef.current !== requestId) return;
 
         const terms = getNormalizedTerms(trimmed);
