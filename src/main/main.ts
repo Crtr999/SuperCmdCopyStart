@@ -3499,10 +3499,15 @@ async function expandSnippetKeywordInPlace(keyword: string, delimiter: string): 
 
     await execFileAsync('osascript', ['-e', script]);
 
-    // Restore user's clipboard after insertion.
+    // Restore user's clipboard after the target app has finished reading
+    // the paste.  Short texts paste almost instantly; longer / multi-line
+    // content needs more time (Outlook, Notion, Safari all read the
+    // clipboard asynchronously).  Scale the delay with content length,
+    // clamped to a reasonable range.
+    const restoreDelay = Math.min(Math.max(200, fullText.length * 2), 2000);
     setTimeout(() => {
       electron.clipboard.writeText(originalClipboard);
-    }, 80);
+    }, restoreDelay);
   } catch (error) {
     console.error('[SnippetExpander] Failed to expand keyword:', error);
   }
