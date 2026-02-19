@@ -54,7 +54,10 @@ interface InlineFileResult {
   path: string;
   name: string;
   dir: string;
+  location: string; // friendly label: "iCloud Drive", "Documents", etc.
 }
+
+const ICLOUD_DRIVE_SUBPATH = '/Library/Mobile Documents/com~apple~CloudDocs';
 
 function fileBasename(filePath: string): string {
   const normalized = filePath.replace(/\/$/, '');
@@ -74,6 +77,25 @@ function asTildePath(filePath: string): string {
     return '~' + (filePath.slice(home.length) || '/');
   }
   return filePath;
+}
+
+function getFileLocation(filePath: string): string {
+  const home = (window.electron as any).homeDir || '';
+  const icloudRoot = home + ICLOUD_DRIVE_SUBPATH;
+  if (filePath.startsWith(icloudRoot + '/') || filePath === icloudRoot) {
+    const relative = filePath.slice(icloudRoot.length + 1);
+    const firstDir = relative.split('/')[0] || '';
+    return firstDir ? `iCloud Drive / ${firstDir}` : 'iCloud Drive';
+  }
+  if (home) {
+    const relative = filePath.startsWith(home + '/') ? filePath.slice(home.length + 1) : '';
+    if (relative.startsWith('Desktop/') || relative === 'Desktop') return 'Desktop';
+    if (relative.startsWith('Documents/') || relative === 'Documents') return 'Documents';
+    if (relative.startsWith('Downloads/') || relative === 'Downloads') return 'Downloads';
+    if (relative.startsWith('Applications/') || relative === 'Applications') return 'Applications';
+  }
+  if (filePath.startsWith('/Applications/')) return 'Applications';
+  return asTildePath(fileDirname(filePath));
 }
 
 function buildInlineSpotlightQuery(rawQuery: string): string {
@@ -794,7 +816,7 @@ const App: React.FC = () => {
   const calcResult = syncCalcResult ?? asyncCalcResult;
   const calcOffset = calcResult ? 1 : 0;
 
-  // ─── Inline file search via Spotlight ────────────────────────────
+  // ─── Inline file search via Spotlight (home + iCloud Drive) ─────
   useEffect(() => {
     const trimmed = searchQuery.trim();
     fileSearchSeqRef.current += 1;
@@ -808,9 +830,19 @@ const App: React.FC = () => {
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir || '/';
+        const icloudPath = homeDir + ICLOUD_DRIVE_SUBPATH;
         const spotlightQuery = buildInlineSpotlightQuery(trimmed);
-        const response = await window.electron.execCommand('mdfind', [
-          '-onlyin', homeDir, spotlightQuery,
+
+        // Search home directory and iCloud Drive in parallel
+        const [homeResponse, icloudResponse] = await Promise.all([
+          window.electron.execCommand('mdfind', [
+            '-onlyin', homeDir, spotlightQuery,
+          ]),
+          // Explicitly search iCloud Drive to ensure its results aren't
+          // crowded out by other home-directory matches
+          window.electron.execCommand('mdfind', [
+            '-onlyin', icloudPath, spotlightQuery,
+          ]).catch(() => ({ stdout: '', stderr: '', exitCode: 1 })),
         ]);
 
         if (fileSearchSeqRef.current !== requestId) return;
@@ -820,17 +852,36 @@ const App: React.FC = () => {
           .split(/\s+/)
           .filter(Boolean);
 
-        const paths = response.stdout
-          .split('\n')
-          .map((l) => l.trim())
-          .filter(Boolean)
-          .filter((p) => matchesAllTerms(fileBasename(p), lowerTerms))
-          .slice(0, 5);
+        const parseAndFilter = (stdout: string): string[] =>
+          stdout
+            .split('\n')
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .filter((p) => matchesAllTerms(fileBasename(p), lowerTerms));
 
-        const results: InlineFileResult[] = paths.map((p) => ({
+        const homePaths = parseAndFilter(homeResponse.stdout);
+        const icloudPaths = parseAndFilter(icloudResponse.stdout);
+
+        // Merge: take up to 5 from iCloud, fill remaining from home (deduplicated)
+        const seen = new Set<string>();
+        const merged: string[] = [];
+
+        // Prioritize iCloud results so they always appear
+        for (const p of icloudPaths) {
+          if (merged.length >= 5) break;
+          if (!seen.has(p)) { seen.add(p); merged.push(p); }
+        }
+        // Fill with home results (apps, docs, downloads, etc.)
+        for (const p of homePaths) {
+          if (merged.length >= 8) break;
+          if (!seen.has(p)) { seen.add(p); merged.push(p); }
+        }
+
+        const results: InlineFileResult[] = merged.map((p) => ({
           path: p,
           name: fileBasename(p),
           dir: fileDirname(p),
+          location: getFileLocation(p),
         }));
 
         setFileResults(results);
@@ -2079,7 +2130,7 @@ const App: React.FC = () => {
                               {file.name}
                             </div>
                             <div className="text-white/50 text-[11px] font-medium truncate">
-                              {asTildePath(file.dir)}
+                              {file.location}
                             </div>
                           </div>
                         </div>
