@@ -998,6 +998,81 @@ const App: React.FC = () => {
   // Renderer-side icon cache ref — survives across searches without causing re-renders
   const iconCacheRef = useRef<Record<string, string>>({});
 
+  /** Helper: run mdfind piped through head so Spotlight exits early via SIGPIPE */
+  const mdfindLimited = useCallback((dir: string, query: string, limit: number) => {
+    // Shell mode: mdfind writes to pipe, head closes it after N lines → SIGPIPE → fast exit
+    const shellEsc = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
+    const cmd = `mdfind -onlyin ${shellEsc(dir)} ${shellEsc(query)} | head -${limit}`;
+    return window.electron.execCommand('sh', ['-c', cmd], { shell: false })
+      .catch(() => ({ stdout: '', stderr: '', exitCode: 1 }));
+  }, []);
+
+  /** Helper: merge paths, build InlineFileResult[], set state, load icons */
+  const applyFileResults = useCallback((
+    paths: string[],
+    requestId: number,
+    lowerTerms: string[],
+  ) => {
+    const filtered = paths.filter((p) => matchesAllTerms(fileBasename(p), lowerTerms));
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const p of filtered) {
+      if (merged.length >= 8) break;
+      if (!seen.has(p)) { seen.add(p); merged.push(p); }
+    }
+
+    const results: InlineFileResult[] = merged.map((p) => ({
+      path: p,
+      name: fileBasename(p),
+      dir: fileDirname(p),
+      location: getFileLocation(p),
+    }));
+
+    if (fileSearchSeqRef.current !== requestId) return;
+    setFileResults(results);
+
+    // Seed with cached icons instantly
+    const alreadyCached: Record<string, string> = {};
+    const needFetch: InlineFileResult[] = [];
+    for (const file of results) {
+      const cached = iconCacheRef.current[file.path];
+      if (cached) {
+        alreadyCached[file.path] = cached;
+      } else {
+        needFetch.push(file);
+      }
+    }
+    if (Object.keys(alreadyCached).length > 0) {
+      setFileIcons((prev) => ({ ...prev, ...alreadyCached }));
+    }
+
+    // Fetch only missing icons (fire-and-forget, don't block)
+    if (needFetch.length > 0) {
+      Promise.all(
+        needFetch.map(async (file) => {
+          try {
+            const dataUrl = await window.electron.getFileIconDataUrl(file.path, 20);
+            return [file.path, dataUrl || ''] as const;
+          } catch {
+            return [file.path, ''] as const;
+          }
+        }),
+      ).then((iconEntries) => {
+        if (fileSearchSeqRef.current !== requestId) return;
+        const newIcons: Record<string, string> = {};
+        for (const [path, icon] of iconEntries) {
+          if (icon) {
+            newIcons[path] = icon;
+            iconCacheRef.current[path] = icon;
+          }
+        }
+        if (Object.keys(newIcons).length > 0) {
+          setFileIcons((prev) => ({ ...prev, ...newIcons }));
+        }
+      });
+    }
+  }, []);
+
   useEffect(() => {
     const trimmed = searchQuery.trim();
     fileSearchSeqRef.current += 1;
@@ -1013,108 +1088,53 @@ const App: React.FC = () => {
         const homeDir = (window.electron as any).homeDir || '/';
         const icloudPath = homeDir + ICLOUD_DRIVE_SUBPATH;
         const spotlightQuery = buildInlineSpotlightQuery(trimmed);
+        const lowerTerms = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
 
-        // Search home directory and iCloud Drive in parallel
-        const [homeResponse, icloudResponse] = await Promise.all([
-          window.electron.execCommand('mdfind', [
-            '-onlyin', homeDir, spotlightQuery,
-          ]),
-          window.electron.execCommand('mdfind', [
-            '-onlyin', icloudPath, spotlightQuery,
-          ]).catch(() => ({ stdout: '', stderr: '', exitCode: 1 })),
-        ]);
+        const parsePaths = (stdout: string): string[] =>
+          stdout.split('\n').map((l) => l.trim()).filter(Boolean);
 
-        if (fileSearchSeqRef.current !== requestId) return;
+        // Fire both searches in parallel
+        const homePromise = mdfindLimited(homeDir, spotlightQuery, 20);
+        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 15);
 
-        const lowerTerms = trimmed
-          .toLowerCase()
-          .split(/\s+/)
-          .filter(Boolean);
+        // Progressive: show results from whichever finishes first
+        let homePaths: string[] = [];
+        let icloudPaths: string[] = [];
+        let firstDone = false;
 
-        const parseAndFilter = (stdout: string): string[] =>
-          stdout
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean)
-            .filter((p) => matchesAllTerms(fileBasename(p), lowerTerms));
+        const showMerged = () => {
+          // iCloud results first, then fill with home results
+          const combined = [...icloudPaths, ...homePaths];
+          applyFileResults(combined, requestId, lowerTerms);
+        };
 
-        const homePaths = parseAndFilter(homeResponse.stdout);
-        const icloudPaths = parseAndFilter(icloudResponse.stdout);
-
-        // Merge: take up to 5 from iCloud, fill remaining from home (deduplicated)
-        const seen = new Set<string>();
-        const merged: string[] = [];
-
-        for (const p of icloudPaths) {
-          if (merged.length >= 5) break;
-          if (!seen.has(p)) { seen.add(p); merged.push(p); }
-        }
-        for (const p of homePaths) {
-          if (merged.length >= 8) break;
-          if (!seen.has(p)) { seen.add(p); merged.push(p); }
-        }
-
-        const results: InlineFileResult[] = merged.map((p) => ({
-          path: p,
-          name: fileBasename(p),
-          dir: fileDirname(p),
-          location: getFileLocation(p),
-        }));
-
-        // Show results immediately — icons will pop in asynchronously
-        setFileResults(results);
-
-        // Seed fileIcons with any already-cached icons so they render instantly
-        const alreadyCached: Record<string, string> = {};
-        const needFetch: InlineFileResult[] = [];
-        for (const file of results) {
-          const cached = iconCacheRef.current[file.path];
-          if (cached) {
-            alreadyCached[file.path] = cached;
-          } else {
-            needFetch.push(file);
-          }
-        }
-        if (Object.keys(alreadyCached).length > 0) {
-          setFileIcons((prev) => ({ ...prev, ...alreadyCached }));
-        }
-
-        // Fetch only missing icons (main process caches by extension too)
-        if (needFetch.length > 0) {
-          const iconEntries = await Promise.all(
-            needFetch.map(async (file) => {
-              try {
-                const dataUrl = await window.electron.getFileIconDataUrl(file.path, 20);
-                return [file.path, dataUrl || ''] as const;
-              } catch {
-                return [file.path, ''] as const;
-              }
-            }),
-          );
-
+        // Race: render the first response immediately, update when second arrives
+        homePromise.then((res) => {
           if (fileSearchSeqRef.current !== requestId) return;
+          homePaths = parsePaths(res.stdout);
+          if (!firstDone) { firstDone = true; showMerged(); }
+        });
 
-          const newIcons: Record<string, string> = {};
-          for (const [path, icon] of iconEntries) {
-            if (icon) {
-              newIcons[path] = icon;
-              iconCacheRef.current[path] = icon;
-            }
-          }
-          if (Object.keys(newIcons).length > 0) {
-            setFileIcons((prev) => ({ ...prev, ...newIcons }));
-          }
-        }
+        icloudPromise.then((res) => {
+          if (fileSearchSeqRef.current !== requestId) return;
+          icloudPaths = parsePaths(res.stdout);
+          if (!firstDone) { firstDone = true; showMerged(); }
+        });
+
+        // Final merge once both are done
+        await Promise.all([homePromise, icloudPromise]);
+        if (fileSearchSeqRef.current !== requestId) return;
+        showMerged();
       } catch (error) {
         console.error('Inline file search failed:', error);
         if (fileSearchSeqRef.current === requestId) {
           setFileResults([]);
         }
       }
-    }, 150);
+    }, 80);
 
     return () => window.clearTimeout(timer);
-  }, [searchQuery]);
+  }, [searchQuery, mdfindLimited, applyFileResults]);
 
   const contextualCommands = commands;
   const filteredCommands = useMemo(
