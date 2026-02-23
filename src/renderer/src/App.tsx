@@ -2332,9 +2332,20 @@ const App: React.FC = () => {
                       {bibleResult.input}
                     </div>
                     <div className="text-white text-sm leading-relaxed line-clamp-4">
-                      {bibleResult.result}
+                      {bibleResult.segments.map((seg, i) =>
+                        seg.red ? (
+                          <span key={i} className="text-red-400">{seg.text}</span>
+                        ) : (
+                          <span key={i}>{seg.text}</span>
+                        )
+                      )}
                     </div>
-                    <div className="text-white/30 text-xs mt-2">{bibleResult.resultLabel}</div>
+                    <div className="text-white/30 text-xs mt-2">
+                      {bibleResult.resultLabel}
+                      {bibleResult.segments.some((s) => s.red) && (
+                        <span className="text-red-400/50 ml-2">Red Letter Edition</span>
+                      )}
+                    </div>
                   </div>
                 );
               })()}
