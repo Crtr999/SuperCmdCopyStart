@@ -17,6 +17,7 @@ import FileSearchExtension from './FileSearchExtension';
 import SuperCmdWhisper from './SuperCmdWhisper';
 import SuperCmdRead from './SuperCmdRead';
 import { tryCalculate, tryCalculateAsync } from './smart-calculator';
+import { isBibleReference, lookupBibleVerse, type BibleResult } from './bible-lookup';
 import { useDetachedPortalWindow } from './useDetachedPortalWindow';
 import { useAppViewManager } from './hooks/useAppViewManager';
 import { useAiChat } from './hooks/useAiChat';
@@ -958,7 +959,40 @@ const App: React.FC = () => {
     };
   }, [searchQuery, syncCalcResult]);
   const calcResult = syncCalcResult ?? asyncCalcResult;
-  const calcOffset = calcResult ? 1 : 0;
+
+  // ─── Bible verse lookup ─────────────────────────────────────────
+  const bibleSeqRef = useRef(0);
+  const [bibleResult, setBibleResult] = useState<BibleResult | null>(null);
+
+  useEffect(() => {
+    bibleSeqRef.current += 1;
+    const seq = bibleSeqRef.current;
+
+    // Skip if calculator already matched, or query is empty
+    if (!searchQuery || calcResult) {
+      setBibleResult(null);
+      return;
+    }
+
+    // Quick synchronous check: does this look like a Bible reference?
+    const ref = isBibleReference(searchQuery);
+    if (!ref) {
+      setBibleResult(null);
+      return;
+    }
+
+    // Fetch the verse (may be instant if book is cached)
+    void lookupBibleVerse(searchQuery).then((result) => {
+      if (bibleSeqRef.current !== seq) return;
+      setBibleResult(result);
+    }).catch(() => {
+      if (bibleSeqRef.current !== seq) return;
+      setBibleResult(null);
+    });
+  }, [searchQuery, calcResult]);
+
+  /** Number of special result cards shown above the command list */
+  const calcOffset = (calcResult ? 1 : 0) + (bibleResult ? 1 : 0);
 
   // ─── Inline file search via Spotlight (home + iCloud Drive) ─────
   useEffect(() => {
@@ -1067,9 +1101,9 @@ const App: React.FC = () => {
     [contextualCommands, searchQuery]
   );
 
-  // When calculator is showing but no commands match, show unfiltered list below
+  // When calculator/bible is showing but no commands match, show unfiltered list below
   const sourceCommands =
-    calcResult && filteredCommands.length === 0 ? contextualCommands : filteredCommands;
+    (calcResult || bibleResult) && filteredCommands.length === 0 ? contextualCommands : filteredCommands;
 
   const groupedCommands = useMemo(() => {
     const sourceMap = new Map(sourceCommands.map((cmd) => [cmd.id, cmd]));
@@ -1288,6 +1322,9 @@ const App: React.FC = () => {
           if (calcResult && selectedIndex === 0) {
             navigator.clipboard.writeText(calcResult.result);
             window.electron.hideWindow();
+          } else if (bibleResult && selectedIndex === (calcResult ? 1 : 0)) {
+            navigator.clipboard.writeText(bibleResult.verseText);
+            window.electron.hideWindow();
           } else if (selectedIndex < calcOffset + displayCommands.length && displayCommands[selectedIndex - calcOffset]) {
             handleCommandExecute(displayCommands[selectedIndex - calcOffset]);
           } else {
@@ -1323,6 +1360,7 @@ const App: React.FC = () => {
       aiAvailable,
       startAiChat,
       calcResult,
+      bibleResult,
       calcOffset,
       unpinnedFileResults,
       openFileResult,
@@ -2238,7 +2276,7 @@ const App: React.FC = () => {
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">Discovering apps...</p>
             </div>
-          ) : displayCommands.length === 0 && unpinnedFileResults.length === 0 && !calcResult ? (
+          ) : displayCommands.length === 0 && unpinnedFileResults.length === 0 && !calcResult && !bibleResult ? (
             <div className="flex items-center justify-center h-full text-white/50">
               <p className="text-sm">No matching results</p>
             </div>
@@ -2272,6 +2310,34 @@ const App: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              {/* Bible verse card */}
+              {bibleResult && (() => {
+                const bibleIdx = calcResult ? 1 : 0;
+                return (
+                  <div
+                    ref={(el) => (itemRefs.current[bibleIdx] = el)}
+                    className={`mx-1 mt-0.5 mb-2 px-5 py-4 rounded-xl cursor-pointer transition-colors border ${
+                      selectedIndex === bibleIdx
+                        ? 'bg-white/[0.08] border-white/[0.12]'
+                        : 'bg-white/[0.03] border-white/[0.06] hover:bg-white/[0.05]'
+                    }`}
+                    onClick={() => {
+                      navigator.clipboard.writeText(bibleResult.verseText);
+                      window.electron.hideWindow();
+                    }}
+                    onMouseMove={() => setSelectedIndex(bibleIdx)}
+                  >
+                    <div className="text-white/50 text-xs font-medium mb-2 tracking-wide uppercase">
+                      {bibleResult.input}
+                    </div>
+                    <div className="text-white text-sm leading-relaxed line-clamp-4">
+                      {bibleResult.result}
+                    </div>
+                    <div className="text-white/30 text-xs mt-2">{bibleResult.resultLabel}</div>
+                  </div>
+                );
+              })()}
 
               {[
                 { title: 'Selected Text', items: groupedCommands.contextual },
