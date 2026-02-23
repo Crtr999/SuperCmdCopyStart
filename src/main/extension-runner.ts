@@ -469,6 +469,43 @@ function resolveEntryFile(extPath: string, cmd: any): string | null {
 }
 
 /**
+ * Extract unresolvable module names from an esbuild error.
+ * esbuild errors include messages like: Could not resolve "some-module"
+ */
+function extractUnresolvableFromError(e: any): string[] {
+  const modules = new Set<string>();
+  const errorText = String(e?.message || e || '');
+  // esbuild format: Could not resolve "module-name"
+  const regex = /Could not resolve ["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(errorText)) !== null) {
+    modules.add(m[1]);
+  }
+  // Also check esbuild's structured errors array
+  if (Array.isArray(e?.errors)) {
+    for (const err of e.errors) {
+      const text = String(err?.text || '');
+      const m2 = /Could not resolve ["']([^"']+)["']/.exec(text);
+      if (m2) modules.add(m2[1]);
+    }
+  }
+  return Array.from(modules);
+}
+
+/**
+ * Run a diagnostic build with write:false to discover unresolvable modules
+ * without producing output. Returns the module names that failed to resolve.
+ */
+async function collectUnresolvableModules(esbuild: any, opts: any): Promise<string[]> {
+  try {
+    await esbuild.build({ ...opts, write: false, logLevel: 'silent' });
+    return [];
+  } catch (e: any) {
+    return extractUnresolvableFromError(e);
+  }
+}
+
+/**
  * Build ALL commands for an installed extension using esbuild.
  * Called at install time so the extension is ready to run instantly.
  *
@@ -543,86 +580,126 @@ export async function buildAllCommands(extName: string, extPathOverride?: string
 
     const outFile = path.join(buildDir, `${cmd.name}.js`);
 
+    const baseExternal = [
+      // React — provided by the renderer at runtime
+      'react',
+      'react-dom',
+      'react-dom/*',
+      'react/jsx-runtime',
+      'react/jsx-dev-runtime',
+      // Raycast — provided by our shim
+      '@raycast/api',
+      '@raycast/utils',
+      // Native C++ addons — cannot be bundled, we stub them at runtime
+      're2',
+      'better-sqlite3',
+      'fsevents',
+      // Cross-extension calls — not supported, stubbed
+      'raycast-cross-extension',
+      // Fetch libs — use runtime shims in renderer instead of bundling Node internals
+      'node-fetch',
+      'undici',
+      'undici/*',
+      // HTTP / file-download / archive packages — must be kept external so our renderer
+      // shim can intercept them and route file I/O through the main process (which has
+      // real filesystem access). Bundling them inline breaks binary downloads because the
+      // browser renderer cannot do streaming file writes or archive extraction natively.
+      'axios',
+      'tar',
+      'extract-zip',
+      'sha256-file',
+      // Respect extension-defined externals from manifest
+      ...manifestExternal,
+      // Node.js built-ins — stubbed at runtime in the renderer
+      ...nodeBuiltins,
+    ];
+
+    const buildPlugins = [
+      // Mark swift:/rust: imports as external so fakeRequire can handle them at runtime
+      {
+        name: 'scheme-external',
+        setup(build: any) {
+          build.onResolve({ filter: /^(swift|rust):/ }, (args: any) => ({
+            path: args.path,
+            external: true,
+          }));
+        },
+      },
+      // Mark .node native addons and WASM files as external
+      {
+        name: 'native-external',
+        setup(build: any) {
+          build.onResolve({ filter: /\.(node|wasm)$/ }, (args: any) => ({
+            path: args.path,
+            external: true,
+          }));
+        },
+      },
+    ];
+
+    const buildOptions = {
+      entryPoints: [entryFile],
+      bundle: true,
+      format: 'cjs' as const,
+      platform: 'node' as const,
+      outfile: outFile,
+      plugins: buildPlugins,
+      external: baseExternal,
+      nodePaths: fs.existsSync(extNodeModules) ? [extNodeModules] : [],
+      target: 'es2020',
+      jsx: 'automatic' as const,
+      jsxImportSource: 'react',
+      tsconfigRaw: JSON.stringify({
+        compilerOptions: {
+          target: 'ES2020',
+          jsx: 'react-jsx',
+          jsxImportSource: 'react',
+          strict: false,
+          esModuleInterop: true,
+          moduleResolution: 'node',
+        },
+      }),
+      define: {
+        'process.env.NODE_ENV': '"production"',
+        'global': 'globalThis',
+      },
+      logLevel: 'error' as const,
+    };
+
     try {
       console.log(`  Building ${extName}/${cmd.name}…`);
+      await esbuild.build(buildOptions);
 
-      await esbuild.build({
-        entryPoints: [entryFile],
-        bundle: true,
-        format: 'cjs',
-        platform: 'node',
-        outfile: outFile,
-        plugins: [
-          // Mark swift: imports as external so fakeRequire can handle them at runtime
-          {
-            name: 'swift-external',
-            setup(build: any) {
-              build.onResolve({ filter: /^swift:/ }, (args: any) => ({
-                path: args.path,
-                external: true,
-              }));
-            },
-          },
-        ],
-        external: [
-          // React — provided by the renderer at runtime
-          'react',
-          'react-dom',
-          'react-dom/*',
-          'react/jsx-runtime',
-          'react/jsx-dev-runtime',
-          // Raycast — provided by our shim
-          '@raycast/api',
-          '@raycast/utils',
-          // Native C++ addons — cannot be bundled, we stub them at runtime
-          're2',
-          'better-sqlite3',
-          'fsevents',
-          // Cross-extension calls — not supported, stubbed
-          'raycast-cross-extension',
-          // Fetch libs — use runtime shims in renderer instead of bundling Node internals
-          'node-fetch',
-          'undici',
-          'undici/*',
-          // HTTP / file-download / archive packages — must be kept external so our renderer
-          // shim can intercept them and route file I/O through the main process (which has
-          // real filesystem access). Bundling them inline breaks binary downloads because the
-          // browser renderer cannot do streaming file writes or archive extraction natively.
-          'axios',
-          'tar',
-          'extract-zip',
-          'sha256-file',
-          // Respect extension-defined externals from manifest
-          ...manifestExternal,
-          // Node.js built-ins — stubbed at runtime in the renderer
-          ...nodeBuiltins,
-        ],
-        nodePaths: fs.existsSync(extNodeModules) ? [extNodeModules] : [],
-        target: 'es2020',
-        jsx: 'automatic',
-        jsxImportSource: 'react',
-        tsconfigRaw: JSON.stringify({
-          compilerOptions: {
-            target: 'ES2020',
-            jsx: 'react-jsx',
-            jsxImportSource: 'react',
-            strict: false,
-            esModuleInterop: true,
-            moduleResolution: 'node',
-          },
-        }),
-        define: {
-          'process.env.NODE_ENV': '"production"',
-          'global': 'globalThis',
-        },
-        logLevel: 'warning',
-      });
+      if (!fs.existsSync(outFile)) {
+        // Build completed without throwing but produced no output — retry
+        // with unresolvable modules extracted from a diagnostic build.
+        console.warn(`  Build produced no output for ${extName}/${cmd.name}, retrying with resolve errors externalized…`);
+        const extraExternals = await collectUnresolvableModules(esbuild, buildOptions);
+        if (extraExternals.length > 0) {
+          console.log(`  Retrying with externals: ${extraExternals.join(', ')}`);
+          await esbuild.build({ ...buildOptions, external: [...baseExternal, ...extraExternals] });
+        }
+      }
 
       if (fs.existsSync(outFile)) {
         built++;
       }
-    } catch (e) {
-      console.error(`  esbuild failed for ${extName}/${cmd.name}:`, e);
+    } catch (e: any) {
+      // esbuild threw — try to extract unresolvable modules from error and retry
+      const extraExternals = extractUnresolvableFromError(e);
+      if (extraExternals.length > 0) {
+        console.warn(`  Build failed for ${extName}/${cmd.name}, retrying with externals: ${extraExternals.join(', ')}`);
+        try {
+          await esbuild.build({ ...buildOptions, external: [...baseExternal, ...extraExternals] });
+          if (fs.existsSync(outFile)) {
+            built++;
+          }
+        } catch (retryErr) {
+          console.error(`  esbuild retry failed for ${extName}/${cmd.name}:`, retryErr);
+        }
+      } else {
+        console.error(`  esbuild failed for ${extName}/${cmd.name}:`, e);
+      }
     }
   }
 
@@ -835,58 +912,93 @@ export async function buildSingleCommand(extName: string, cmdName: string): Prom
     if (!fs.existsSync(extNodeModules)) return false;
   }
 
-  try {
-    const esbuild = requireEsbuild();
-    console.log(`  On-demand building ${extName}/${cmdName}…`);
-    await esbuild.build({
-      entryPoints: [entryFile],
-      bundle: true,
-      format: 'cjs',
-      platform: 'node',
-      outfile: outFile,
-      plugins: [
-        {
-          name: 'swift-external',
-          setup(build: any) {
-            build.onResolve({ filter: /^swift:/ }, (args: any) => ({
-              path: args.path,
-              external: true,
-            }));
-          },
-        },
-      ],
-      external: [
-        'react', 'react-dom', 'react-dom/*', 'react/jsx-runtime', 'react/jsx-dev-runtime',
-        '@raycast/api', '@raycast/utils',
-        're2', 'better-sqlite3', 'fsevents',
-        'raycast-cross-extension',
-        'node-fetch', 'undici', 'undici/*',
-        'axios', 'tar', 'extract-zip', 'sha256-file',
-        ...manifestExternal,
-        ...nodeBuiltins,
-      ],
-      nodePaths: fs.existsSync(extNodeModules) ? [extNodeModules] : [],
-      target: 'es2020',
-      jsx: 'automatic',
-      jsxImportSource: 'react',
-      tsconfigRaw: JSON.stringify({
-        compilerOptions: {
-          target: 'ES2020',
-          jsx: 'react-jsx',
-          jsxImportSource: 'react',
-          strict: false,
-          esModuleInterop: true,
-          moduleResolution: 'node',
-        },
-      }),
-      define: {
-        'process.env.NODE_ENV': '"production"',
-        'global': 'globalThis',
+  const esbuild = requireEsbuild();
+  const baseExternal = [
+    'react', 'react-dom', 'react-dom/*', 'react/jsx-runtime', 'react/jsx-dev-runtime',
+    '@raycast/api', '@raycast/utils',
+    're2', 'better-sqlite3', 'fsevents',
+    'raycast-cross-extension',
+    'node-fetch', 'undici', 'undici/*',
+    'axios', 'tar', 'extract-zip', 'sha256-file',
+    ...manifestExternal,
+    ...nodeBuiltins,
+  ];
+
+  const buildPlugins = [
+    {
+      name: 'scheme-external',
+      setup(build: any) {
+        build.onResolve({ filter: /^(swift|rust):/ }, (args: any) => ({
+          path: args.path,
+          external: true,
+        }));
       },
-      logLevel: 'warning',
-    });
+    },
+    {
+      name: 'native-external',
+      setup(build: any) {
+        build.onResolve({ filter: /\.(node|wasm)$/ }, (args: any) => ({
+          path: args.path,
+          external: true,
+        }));
+      },
+    },
+  ];
+
+  const buildOptions = {
+    entryPoints: [entryFile],
+    bundle: true,
+    format: 'cjs' as const,
+    platform: 'node' as const,
+    outfile: outFile,
+    plugins: buildPlugins,
+    external: baseExternal,
+    nodePaths: fs.existsSync(extNodeModules) ? [extNodeModules] : [],
+    target: 'es2020',
+    jsx: 'automatic' as const,
+    jsxImportSource: 'react',
+    tsconfigRaw: JSON.stringify({
+      compilerOptions: {
+        target: 'ES2020',
+        jsx: 'react-jsx',
+        jsxImportSource: 'react',
+        strict: false,
+        esModuleInterop: true,
+        moduleResolution: 'node',
+      },
+    }),
+    define: {
+      'process.env.NODE_ENV': '"production"',
+      'global': 'globalThis',
+    },
+    logLevel: 'error' as const,
+  };
+
+  try {
+    console.log(`  On-demand building ${extName}/${cmdName}…`);
+    await esbuild.build(buildOptions);
+
+    if (!fs.existsSync(outFile)) {
+      const extraExternals = await collectUnresolvableModules(esbuild, buildOptions);
+      if (extraExternals.length > 0) {
+        console.log(`  Retrying on-demand build with externals: ${extraExternals.join(', ')}`);
+        await esbuild.build({ ...buildOptions, external: [...baseExternal, ...extraExternals] });
+      }
+    }
+
     return fs.existsSync(outFile);
-  } catch (e) {
+  } catch (e: any) {
+    const extraExternals = extractUnresolvableFromError(e);
+    if (extraExternals.length > 0) {
+      console.warn(`  On-demand build failed for ${extName}/${cmdName}, retrying with externals: ${extraExternals.join(', ')}`);
+      try {
+        await esbuild.build({ ...buildOptions, external: [...baseExternal, ...extraExternals] });
+        return fs.existsSync(outFile);
+      } catch (retryErr) {
+        console.error(`  On-demand esbuild retry failed for ${extName}/${cmdName}:`, retryErr);
+        return false;
+      }
+    }
     console.error(`  On-demand esbuild failed for ${extName}/${cmdName}:`, e);
     return false;
   }
