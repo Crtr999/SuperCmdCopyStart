@@ -6928,16 +6928,47 @@ return appURL's |path|() as text`,
     }
   });
 
+  // Icon cache keyed by extension+size — files with the same extension share the same icon.
+  // .app bundles and extensionless files are keyed by full path since their icons are unique.
+  const iconCache = new Map<string, string | null>();
+  const pendingIconFetches = new Map<string, Promise<string | null>>();
+
+  function iconCacheKey(filePath: string, size: number): string {
+    const lastSlash = filePath.lastIndexOf('/');
+    const name = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
+    const dotIdx = name.lastIndexOf('.');
+    const ext = dotIdx > 0 ? name.slice(dotIdx).toLowerCase() : '';
+    // .app bundles and files without extensions have unique icons → key by path
+    if (!ext || ext === '.app') return `${filePath}@${size}`;
+    return `${ext}@${size}`;
+  }
+
   ipcMain.handle('get-file-icon-data-url', async (_event: any, filePath: string, size = 20) => {
-    try {
-      const icon = await app.getFileIcon(filePath, { size: size <= 16 ? 'small' : size >= 64 ? 'large' : 'normal' });
-      if (icon && !icon.isEmpty()) {
-        return icon.resize({ width: size, height: size }).toDataURL();
+    const key = iconCacheKey(filePath, size);
+    if (iconCache.has(key)) return iconCache.get(key)!;
+    // Dedup concurrent fetches for the same key
+    if (pendingIconFetches.has(key)) return pendingIconFetches.get(key)!;
+
+    const promise = (async (): Promise<string | null> => {
+      try {
+        const icon = await app.getFileIcon(filePath, { size: size <= 16 ? 'small' : size >= 64 ? 'large' : 'normal' });
+        if (icon && !icon.isEmpty()) {
+          const dataUrl = icon.resize({ width: size, height: size }).toDataURL();
+          iconCache.set(key, dataUrl);
+          return dataUrl;
+        }
+        iconCache.set(key, null);
+        return null;
+      } catch {
+        iconCache.set(key, null);
+        return null;
+      } finally {
+        pendingIconFetches.delete(key);
       }
-      return null;
-    } catch {
-      return null;
-    }
+    })();
+
+    pendingIconFetches.set(key, promise);
+    return promise;
   });
 
   // Get system appearance

@@ -995,6 +995,9 @@ const App: React.FC = () => {
   const calcOffset = (calcResult ? 1 : 0) + (bibleResult ? 1 : 0);
 
   // ─── Inline file search via Spotlight (home + iCloud Drive) ─────
+  // Renderer-side icon cache ref — survives across searches without causing re-renders
+  const iconCacheRef = useRef<Record<string, string>>({});
+
   useEffect(() => {
     const trimmed = searchQuery.trim();
     fileSearchSeqRef.current += 1;
@@ -1016,8 +1019,6 @@ const App: React.FC = () => {
           window.electron.execCommand('mdfind', [
             '-onlyin', homeDir, spotlightQuery,
           ]),
-          // Explicitly search iCloud Drive to ensure its results aren't
-          // crowded out by other home-directory matches
           window.electron.execCommand('mdfind', [
             '-onlyin', icloudPath, spotlightQuery,
           ]).catch(() => ({ stdout: '', stderr: '', exitCode: 1 })),
@@ -1044,12 +1045,10 @@ const App: React.FC = () => {
         const seen = new Set<string>();
         const merged: string[] = [];
 
-        // Prioritize iCloud results so they always appear
         for (const p of icloudPaths) {
           if (merged.length >= 5) break;
           if (!seen.has(p)) { seen.add(p); merged.push(p); }
         }
-        // Fill with home results (apps, docs, downloads, etc.)
         for (const p of homePaths) {
           if (merged.length >= 8) break;
           if (!seen.has(p)) { seen.add(p); merged.push(p); }
@@ -1062,35 +1061,57 @@ const App: React.FC = () => {
           location: getFileLocation(p),
         }));
 
+        // Show results immediately — icons will pop in asynchronously
         setFileResults(results);
 
-        // Load file icons for the results
-        const iconEntries = await Promise.all(
-          results.map(async (file) => {
-            try {
-              const dataUrl = await window.electron.getFileIconDataUrl(file.path, 20);
-              return [file.path, dataUrl || ''] as const;
-            } catch {
-              return [file.path, ''] as const;
-            }
-          }),
-        );
-
-        if (fileSearchSeqRef.current !== requestId) return;
-        setFileIcons((prev) => {
-          const next = { ...prev };
-          for (const [path, icon] of iconEntries) {
-            if (icon) next[path] = icon;
+        // Seed fileIcons with any already-cached icons so they render instantly
+        const alreadyCached: Record<string, string> = {};
+        const needFetch: InlineFileResult[] = [];
+        for (const file of results) {
+          const cached = iconCacheRef.current[file.path];
+          if (cached) {
+            alreadyCached[file.path] = cached;
+          } else {
+            needFetch.push(file);
           }
-          return next;
-        });
+        }
+        if (Object.keys(alreadyCached).length > 0) {
+          setFileIcons((prev) => ({ ...prev, ...alreadyCached }));
+        }
+
+        // Fetch only missing icons (main process caches by extension too)
+        if (needFetch.length > 0) {
+          const iconEntries = await Promise.all(
+            needFetch.map(async (file) => {
+              try {
+                const dataUrl = await window.electron.getFileIconDataUrl(file.path, 20);
+                return [file.path, dataUrl || ''] as const;
+              } catch {
+                return [file.path, ''] as const;
+              }
+            }),
+          );
+
+          if (fileSearchSeqRef.current !== requestId) return;
+
+          const newIcons: Record<string, string> = {};
+          for (const [path, icon] of iconEntries) {
+            if (icon) {
+              newIcons[path] = icon;
+              iconCacheRef.current[path] = icon;
+            }
+          }
+          if (Object.keys(newIcons).length > 0) {
+            setFileIcons((prev) => ({ ...prev, ...newIcons }));
+          }
+        }
       } catch (error) {
         console.error('Inline file search failed:', error);
         if (fileSearchSeqRef.current === requestId) {
           setFileResults([]);
         }
       }
-    }, 50);
+    }, 150);
 
     return () => window.clearTimeout(timer);
   }, [searchQuery]);
