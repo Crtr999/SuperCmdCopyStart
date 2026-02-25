@@ -1026,13 +1026,10 @@ const App: React.FC = () => {
   // Renderer-side icon cache ref — survives across searches without causing re-renders
   const iconCacheRef = useRef<Record<string, string>>({});
 
-  /** Helper: run mdfind with head limit + 1s timeout (SIGALRM kills stale searches) */
+  /** Helper: run mdfind piped through head so Spotlight exits early via SIGPIPE */
   const mdfindLimited = useCallback((dir: string, query: string, limit: number) => {
     const shellEsc = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
-    // perl alarm(1) sends SIGALRM after 1s, killing mdfind if it's still running;
-    // head closes the pipe via SIGPIPE once we have enough results.
-    // Whichever fires first stops the search — guarantees <1s worst-case.
-    const cmd = `perl -e 'alarm(1); exec @ARGV' -- mdfind -onlyin ${shellEsc(dir)} ${shellEsc(query)} | head -${limit}`;
+    const cmd = `mdfind -onlyin ${shellEsc(dir)} ${shellEsc(query)} | head -${limit}`;
     return window.electron.execCommand('sh', ['-c', cmd], { shell: false })
       .catch(() => ({ stdout: '', stderr: '', exitCode: 1 }));
   }, []);
@@ -1119,7 +1116,7 @@ const App: React.FC = () => {
 
     const lowerTerms = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
 
-    // ── Fast path: query is a refinement of cached query → filter instantly, no mdfind.
+    // ── Instant preview: if query refines cached query, show filtered results NOW
     const cached = mdfindCacheRef.current;
     if (
       cached.query &&
@@ -1127,10 +1124,10 @@ const App: React.FC = () => {
       trimmed.toLowerCase().startsWith(cached.query.toLowerCase())
     ) {
       applyFileResults(cached.rawPaths, requestId, lowerTerms);
-      return; // no timer to clean up
     }
 
-    // ── Slow path: new/different query → run mdfind (debounced 30ms)
+    // ── Always run mdfind after debounce for accurate/complete results.
+    // 120ms debounce coalesces rapid keystrokes so we don't spawn per-character.
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir || '/';
@@ -1140,20 +1137,20 @@ const App: React.FC = () => {
         const parsePaths = (stdout: string): string[] =>
           stdout.split('\n').map((l) => l.trim()).filter(Boolean);
 
-        const homePromise = mdfindLimited(homeDir, spotlightQuery, 50);
-        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 30);
+        const homePromise = mdfindLimited(homeDir, spotlightQuery, 80);
+        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 40);
 
         let homePaths: string[] = [];
         let icloudPaths: string[] = [];
 
         const showMerged = () => {
           const combined = [...icloudPaths, ...homePaths];
-          // Cache raw paths so subsequent refinements are instant
+          // Update cache so subsequent refinements get an instant preview
           mdfindCacheRef.current = { query: trimmed, rawPaths: combined };
           applyFileResults(combined, requestId, lowerTerms);
         };
 
-        // Render as EACH search completes — not just the first
+        // Render as EACH search completes
         homePromise.then((res) => {
           if (fileSearchSeqRef.current !== requestId) return;
           homePaths = parsePaths(res.stdout);
@@ -1166,7 +1163,6 @@ const App: React.FC = () => {
           showMerged();
         });
 
-        // Final merge once both are done
         await Promise.all([homePromise, icloudPromise]);
         if (fileSearchSeqRef.current !== requestId) return;
         showMerged();
@@ -1176,7 +1172,7 @@ const App: React.FC = () => {
           setFileResults([]);
         }
       }
-    }, 30);
+    }, 120);
 
     return () => window.clearTimeout(timer);
   }, [searchQuery, mdfindLimited, applyFileResults]);
