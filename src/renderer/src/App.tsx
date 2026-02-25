@@ -139,14 +139,44 @@ function buildInlineSpotlightQuery(rawQuery: string): string {
     .map((t) => t.trim())
     .filter(Boolean);
   if (terms.length === 0) return 'kMDItemFSName == "*"cd';
+  const esc = (t: string) => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return terms
-    .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
+    .map((t) => {
+      const e = esc(t);
+      return `(kMDItemFSName == "*${e}*"cd || kMDItemDisplayName == "*${e}*"cd)`;
+    })
     .join(' && ');
 }
 
 function matchesAllTerms(fileName: string, terms: string[]): boolean {
   const lower = fileName.toLowerCase();
   return terms.every((t) => lower.includes(t));
+}
+
+/** Score a file path for relevance to search terms (higher = better match). */
+function scoreFileResult(filePath: string, terms: string[]): number {
+  const name = fileBasename(filePath).toLowerCase();
+  const nameNoExt = name.replace(/\.[^.]+$/, '');
+  let score = 0;
+
+  for (const t of terms) {
+    if (nameNoExt === t) {
+      score += 200;               // exact name match (sans extension)
+    } else if (nameNoExt.startsWith(t)) {
+      score += 100;               // prefix match
+    } else if (name.startsWith(t)) {
+      score += 90;                // prefix with extension
+    } else if (nameNoExt.includes(t)) {
+      score += 50;                // substring match
+    } else {
+      score += 10;                // display-name-only / fallback match
+    }
+  }
+
+  // Bonus: shorter names are more specific / likely what user wants
+  score += Math.max(0, 60 - name.length);
+
+  return score;
 }
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1014,12 +1044,15 @@ const App: React.FC = () => {
     lowerTerms: string[],
   ) => {
     const filtered = paths.filter((p) => matchesAllTerms(fileBasename(p), lowerTerms));
+    // Deduplicate
     const seen = new Set<string>();
-    const merged: string[] = [];
+    const unique: string[] = [];
     for (const p of filtered) {
-      if (merged.length >= 8) break;
-      if (!seen.has(p)) { seen.add(p); merged.push(p); }
+      if (!seen.has(p)) { seen.add(p); unique.push(p); }
     }
+    // Rank by relevance and take top results
+    unique.sort((a, b) => scoreFileResult(b, lowerTerms) - scoreFileResult(a, lowerTerms));
+    const merged = unique.slice(0, 12);
 
     const results: InlineFileResult[] = merged.map((p) => ({
       path: p,
@@ -1094,8 +1127,8 @@ const App: React.FC = () => {
           stdout.split('\n').map((l) => l.trim()).filter(Boolean);
 
         // Fire both searches in parallel
-        const homePromise = mdfindLimited(homeDir, spotlightQuery, 20);
-        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 15);
+        const homePromise = mdfindLimited(homeDir, spotlightQuery, 50);
+        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 30);
 
         // Progressive: show results from whichever finishes first
         let homePaths: string[] = [];
@@ -1131,7 +1164,7 @@ const App: React.FC = () => {
           setFileResults([]);
         }
       }
-    }, 80);
+    }, 30);
 
     return () => window.clearTimeout(timer);
   }, [searchQuery, mdfindLimited, applyFileResults]);
