@@ -82,13 +82,12 @@ function buildNameOnlySpotlightQuery(rawQuery: string): string {
     return 'kMDItemFSName == "*"cd';
   }
 
-  // Name-only matching. This prevents matches from parent directory names.
-  const nameFilter = terms
+  // Simple name-only query — no content-type filter. Adding kMDItemContentTypeTree
+  // conditions slows Spotlight cold starts significantly. Junk results are filtered
+  // client-side instead.
+  return terms
     .map((term) => `kMDItemFSName == "*${escapeSpotlightValue(term)}*"cd`)
     .join(' && ');
-  // Restrict to user-relevant content types
-  const typeFilter = '(kMDItemContentTypeTree == "public.content" || kMDItemContentTypeTree == "public.composite-content" || kMDItemContentTypeTree == "public.archive" || kMDItemContentTypeTree == "com.apple.package" || kMDItemContentTypeTree == "public.folder")';
-  return `${nameFilter} && ${typeFilter}`;
 }
 
 function getNormalizedTerms(rawQuery: string): string[] {

@@ -7028,14 +7028,16 @@ return appURL's |path|() as text`,
           resolve(results);
         });
 
-        // Safety timeout — if mdfind hangs, resolve with whatever we have
+        // Safety timeout — generous to allow for Spotlight cold starts.
+        // mdfind's first invocation can take several seconds while mds
+        // loads its index; subsequent calls are fast (<200ms).
         setTimeout(() => {
           if (!done) {
             done = true;
             proc.kill('SIGTERM');
             resolve(results);
           }
-        }, 2000);
+        }, 10000);
       });
     }
   );

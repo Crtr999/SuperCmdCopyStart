@@ -139,12 +139,30 @@ function buildInlineSpotlightQuery(rawQuery: string): string {
     .map((t) => t.trim())
     .filter(Boolean);
   if (terms.length === 0) return 'kMDItemFSName == "*"cd';
-  const nameFilter = terms
+  // Simple name-only query — no content-type filter. Content-type filtering
+  // adds Spotlight query complexity and slows cold starts. We filter junk
+  // paths client-side instead, which is essentially free.
+  return terms
     .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
     .join(' && ');
-  // Restrict to user-relevant content types to avoid cache files, build artifacts, etc.
-  const typeFilter = '(kMDItemContentTypeTree == "public.content" || kMDItemContentTypeTree == "public.composite-content" || kMDItemContentTypeTree == "public.archive" || kMDItemContentTypeTree == "com.apple.package" || kMDItemContentTypeTree == "public.folder")';
-  return `${nameFilter} && ${typeFilter}`;
+}
+
+/** Paths containing these segments are junk — filter them out client-side. */
+const JUNK_PATH_SEGMENTS = [
+  '/node_modules/', '/.git/', '/.Trash/', '/Library/Caches/',
+  '/Library/Application Support/CrashReporter/', '/Library/Logs/',
+  '/.npm/', '/.cache/', '/DerivedData/', '/__pycache__/',
+  '/Library/Developer/', '/Library/Group Containers/',
+];
+
+function isJunkPath(filePath: string): boolean {
+  for (const seg of JUNK_PATH_SEGMENTS) {
+    if (filePath.includes(seg)) return true;
+  }
+  // Skip hidden files/dirs (starting with .) except well-known locations
+  const name = filePath.slice(filePath.lastIndexOf('/') + 1);
+  if (name.startsWith('.') && name !== '.docx') return true;
+  return false;
 }
 
 function matchesAllTerms(fileName: string, terms: string[]): boolean {
@@ -1029,14 +1047,25 @@ const App: React.FC = () => {
   // Renderer-side icon cache ref — survives across searches without causing re-renders
   const iconCacheRef = useRef<Record<string, string>>({});
 
-  // Warm up Spotlight index on mount so the first real search doesn't pay cold-start cost
+  // Warm up Spotlight's metadata server (mds) on mount.
+  // The first mdfind call after app launch is slow (~1-4s) while mds loads its
+  // filename index into memory. By firing a real query at startup (not trivial —
+  // it must actually exercise the index), the user's first real search will hit
+  // a warm daemon. We search common document dirs to prime the relevant index
+  // partitions.
   const spotlightWarmedUp = useRef(false);
   useEffect(() => {
     if (spotlightWarmedUp.current) return;
     spotlightWarmedUp.current = true;
     const homeDir = (window.electron as any).homeDir || '/';
-    // Fire a trivial query to prime the Spotlight index — result is discarded
-    window.electron.mdfindSearch(homeDir, 'kMDItemFSName == "*.docx"cd', 1).catch(() => {});
+    // Warm up with a broad name query that exercises the filename index.
+    // Search iCloud + Documents — the dirs users search most.
+    const warmupQuery = 'kMDItemFSName == "*a*"cd';
+    const icloudDir = homeDir + ICLOUD_DRIVE_SUBPATH;
+    const docsDir = homeDir + '/Documents';
+    // Fire both in parallel, discard results — just priming the daemon
+    window.electron.mdfindSearch(icloudDir, warmupQuery, 5).catch(() => {});
+    window.electron.mdfindSearch(docsDir, warmupQuery, 5).catch(() => {});
   }, []);
 
   /** Helper: merge paths, build InlineFileResult[], set state, load icons */
@@ -1045,7 +1074,9 @@ const App: React.FC = () => {
     requestId: number,
     lowerTerms: string[],
   ) => {
-    const filtered = paths.filter((p) => matchesAllTerms(fileBasename(p), lowerTerms));
+    // Filter junk paths client-side (fast) instead of in Spotlight query (slow)
+    const filtered = paths
+      .filter((p) => !isJunkPath(p) && matchesAllTerms(fileBasename(p), lowerTerms));
     // Deduplicate
     const seen = new Set<string>();
     const unique: string[] = [];
@@ -1131,27 +1162,66 @@ const App: React.FC = () => {
       applyFileResults(cached.rawPaths, requestId, lowerTerms);
     }
 
-    // ── Run mdfind via direct IPC (no shell overhead) after short debounce.
-    // 60ms debounce coalesces rapid keystrokes without adding perceptible delay.
+    // ── Tiered parallel search — like macOS Spotlight.
+    // Tier 1: Search specific document directories (small scope = fast).
+    //         iCloud, Documents, Desktop, Downloads complete in <200ms even
+    //         on cold starts because the directory scope is narrow.
+    // Tier 2: Broader home-directory search fills in remaining results.
+    // Results render progressively as each tier completes.
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir || '/';
         const spotlightQuery = buildInlineSpotlightQuery(trimmed);
 
-        // Single mdfind on home dir — iCloud Drive is at ~/Library/Mobile Documents/
-        // so it's already covered. One process = half the overhead.
-        const paths = await window.electron.mdfindSearch(homeDir, spotlightQuery, 80);
+        // Accumulate results across tiers — each tier merges into this set
+        let allPaths: string[] = [];
 
-        if (fileSearchSeqRef.current !== requestId) return;
-        mdfindCacheRef.current = { query: trimmed, rawPaths: paths };
-        applyFileResults(paths, requestId, lowerTerms);
+        const mergePaths = (newPaths: string[]) => {
+          const combined = [...allPaths, ...newPaths];
+          // Deduplicate
+          const seen = new Set<string>();
+          const unique: string[] = [];
+          for (const p of combined) {
+            if (!seen.has(p)) { seen.add(p); unique.push(p); }
+          }
+          allPaths = unique;
+          mdfindCacheRef.current = { query: trimmed, rawPaths: allPaths };
+          applyFileResults(allPaths, requestId, lowerTerms);
+        };
+
+        // ── Tier 1: Document directories (fast, narrow scope)
+        const tier1Dirs = [
+          homeDir + ICLOUD_DRIVE_SUBPATH,  // iCloud Drive
+          homeDir + '/Documents',
+          homeDir + '/Desktop',
+          homeDir + '/Downloads',
+        ];
+        const tier1Promises = tier1Dirs.map((dir) =>
+          window.electron.mdfindSearch(dir, spotlightQuery, 30)
+            .then((paths) => {
+              if (fileSearchSeqRef.current !== requestId) return;
+              mergePaths(paths);
+            })
+            .catch(() => {})
+        );
+
+        // ── Tier 2: Broader home search (slower but comprehensive)
+        const tier2Promise = window.electron.mdfindSearch(homeDir, spotlightQuery, 80)
+          .then((paths) => {
+            if (fileSearchSeqRef.current !== requestId) return;
+            mergePaths(paths);
+          })
+          .catch(() => {});
+
+        // Wait for all to complete (tier 1 results show first as they finish)
+        await Promise.all([...tier1Promises, tier2Promise]);
       } catch (error) {
         console.error('Inline file search failed:', error);
         if (fileSearchSeqRef.current === requestId) {
           setFileResults([]);
         }
       }
-    }, 60);
+    }, 50);
 
     return () => window.clearTimeout(timer);
   }, [searchQuery, applyFileResults]);
