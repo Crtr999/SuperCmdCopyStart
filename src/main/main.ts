@@ -6971,6 +6971,75 @@ return appURL's |path|() as text`,
     return promise;
   });
 
+  // ── Fast mdfind for inline file search ──────────────────────────────
+  // Dedicated handler that spawns mdfind directly (no shell, no PATH
+  // resolution overhead) and kills it as soon as `limit` lines arrive.
+  ipcMain.handle(
+    'mdfind-search',
+    async (
+      _event: any,
+      dir: string,
+      spotlightQuery: string,
+      limit: number
+    ): Promise<string[]> => {
+      const { spawn } = require('child_process');
+      return new Promise((resolve) => {
+        const results: string[] = [];
+        let buffer = '';
+        let done = false;
+
+        const proc = spawn('/usr/bin/mdfind', ['-onlyin', dir, spotlightQuery], {
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+
+        proc.stdout.on('data', (chunk: Buffer) => {
+          if (done) return;
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          // Keep the last (possibly incomplete) line in the buffer
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              results.push(trimmed);
+              if (results.length >= limit) {
+                done = true;
+                proc.kill('SIGTERM');
+                resolve(results);
+                return;
+              }
+            }
+          }
+        });
+
+        proc.on('close', () => {
+          if (done) return;
+          done = true;
+          // Flush remaining buffer
+          if (buffer.trim()) {
+            results.push(buffer.trim());
+          }
+          resolve(results);
+        });
+
+        proc.on('error', () => {
+          if (done) return;
+          done = true;
+          resolve(results);
+        });
+
+        // Safety timeout — if mdfind hangs, resolve with whatever we have
+        setTimeout(() => {
+          if (!done) {
+            done = true;
+            proc.kill('SIGTERM');
+            resolve(results);
+          }
+        }, 2000);
+      });
+    }
+  );
+
   // Get system appearance
   ipcMain.handle('get-appearance', () => {
     return 'dark';

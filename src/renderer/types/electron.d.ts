@@ -389,6 +389,7 @@ export interface ElectronAPI {
   fileExists: (filePath: string) => Promise<boolean>;
   readDir: (dirPath: string) => Promise<string[]>;
   getFileIconDataUrl: (filePath: string, size?: number) => Promise<string | null>;
+  mdfindSearch: (dir: string, spotlightQuery: string, limit: number) => Promise<string[]>;
   getAppearance: () => Promise<'dark' | 'light'>;
 
   // SQLite query execution

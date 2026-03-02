@@ -139,9 +139,12 @@ function buildInlineSpotlightQuery(rawQuery: string): string {
     .map((t) => t.trim())
     .filter(Boolean);
   if (terms.length === 0) return 'kMDItemFSName == "*"cd';
-  return terms
+  const nameFilter = terms
     .map((t) => `kMDItemFSName == "*${t.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}*"cd`)
     .join(' && ');
+  // Restrict to user-relevant content types to avoid cache files, build artifacts, etc.
+  const typeFilter = '(kMDItemContentTypeTree == "public.content" || kMDItemContentTypeTree == "public.composite-content" || kMDItemContentTypeTree == "public.archive" || kMDItemContentTypeTree == "com.apple.package" || kMDItemContentTypeTree == "public.folder")';
+  return `${nameFilter} && ${typeFilter}`;
 }
 
 function matchesAllTerms(fileName: string, terms: string[]): boolean {
@@ -1026,12 +1029,14 @@ const App: React.FC = () => {
   // Renderer-side icon cache ref — survives across searches without causing re-renders
   const iconCacheRef = useRef<Record<string, string>>({});
 
-  /** Helper: run mdfind piped through head so Spotlight exits early via SIGPIPE */
-  const mdfindLimited = useCallback((dir: string, query: string, limit: number) => {
-    const shellEsc = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
-    const cmd = `mdfind -onlyin ${shellEsc(dir)} ${shellEsc(query)} | head -${limit}`;
-    return window.electron.execCommand('sh', ['-c', cmd], { shell: false })
-      .catch(() => ({ stdout: '', stderr: '', exitCode: 1 }));
+  // Warm up Spotlight index on mount so the first real search doesn't pay cold-start cost
+  const spotlightWarmedUp = useRef(false);
+  useEffect(() => {
+    if (spotlightWarmedUp.current) return;
+    spotlightWarmedUp.current = true;
+    const homeDir = (window.electron as any).homeDir || '/';
+    // Fire a trivial query to prime the Spotlight index — result is discarded
+    window.electron.mdfindSearch(homeDir, 'kMDItemFSName == "*.docx"cd', 1).catch(() => {});
   }, []);
 
   /** Helper: merge paths, build InlineFileResult[], set state, load icons */
@@ -1126,56 +1131,30 @@ const App: React.FC = () => {
       applyFileResults(cached.rawPaths, requestId, lowerTerms);
     }
 
-    // ── Always run mdfind after debounce for accurate/complete results.
-    // 120ms debounce coalesces rapid keystrokes so we don't spawn per-character.
+    // ── Run mdfind via direct IPC (no shell overhead) after short debounce.
+    // 60ms debounce coalesces rapid keystrokes without adding perceptible delay.
     const timer = window.setTimeout(async () => {
       try {
         const homeDir = (window.electron as any).homeDir || '/';
-        const icloudPath = homeDir + ICLOUD_DRIVE_SUBPATH;
         const spotlightQuery = buildInlineSpotlightQuery(trimmed);
 
-        const parsePaths = (stdout: string): string[] =>
-          stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+        // Single mdfind on home dir — iCloud Drive is at ~/Library/Mobile Documents/
+        // so it's already covered. One process = half the overhead.
+        const paths = await window.electron.mdfindSearch(homeDir, spotlightQuery, 80);
 
-        const homePromise = mdfindLimited(homeDir, spotlightQuery, 80);
-        const icloudPromise = mdfindLimited(icloudPath, spotlightQuery, 40);
-
-        let homePaths: string[] = [];
-        let icloudPaths: string[] = [];
-
-        const showMerged = () => {
-          const combined = [...icloudPaths, ...homePaths];
-          // Update cache so subsequent refinements get an instant preview
-          mdfindCacheRef.current = { query: trimmed, rawPaths: combined };
-          applyFileResults(combined, requestId, lowerTerms);
-        };
-
-        // Render as EACH search completes
-        homePromise.then((res) => {
-          if (fileSearchSeqRef.current !== requestId) return;
-          homePaths = parsePaths(res.stdout);
-          showMerged();
-        });
-
-        icloudPromise.then((res) => {
-          if (fileSearchSeqRef.current !== requestId) return;
-          icloudPaths = parsePaths(res.stdout);
-          showMerged();
-        });
-
-        await Promise.all([homePromise, icloudPromise]);
         if (fileSearchSeqRef.current !== requestId) return;
-        showMerged();
+        mdfindCacheRef.current = { query: trimmed, rawPaths: paths };
+        applyFileResults(paths, requestId, lowerTerms);
       } catch (error) {
         console.error('Inline file search failed:', error);
         if (fileSearchSeqRef.current === requestId) {
           setFileResults([]);
         }
       }
-    }, 120);
+    }, 60);
 
     return () => window.clearTimeout(timer);
-  }, [searchQuery, mdfindLimited, applyFileResults]);
+  }, [searchQuery, applyFileResults]);
 
   const contextualCommands = commands;
   const filteredCommands = useMemo(

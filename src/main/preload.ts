@@ -420,6 +420,10 @@ contextBridge.exposeInMainWorld('electron', {
   getFileIconDataUrl: (filePath: string, size = 20): Promise<string | null> =>
     ipcRenderer.invoke('get-file-icon-data-url', filePath, size),
 
+  // Fast mdfind for inline file search (avoids shell overhead)
+  mdfindSearch: (dir: string, spotlightQuery: string, limit: number): Promise<string[]> =>
+    ipcRenderer.invoke('mdfind-search', dir, spotlightQuery, limit),
+
   // Get system appearance (dark/light)
   getAppearance: (): Promise<'dark' | 'light'> =>
     ipcRenderer.invoke('get-appearance'),

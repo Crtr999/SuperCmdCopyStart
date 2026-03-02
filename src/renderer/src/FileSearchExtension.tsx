@@ -83,9 +83,12 @@ function buildNameOnlySpotlightQuery(rawQuery: string): string {
   }
 
   // Name-only matching. This prevents matches from parent directory names.
-  return terms
+  const nameFilter = terms
     .map((term) => `kMDItemFSName == "*${escapeSpotlightValue(term)}*"cd`)
     .join(' && ');
+  // Restrict to user-relevant content types
+  const typeFilter = '(kMDItemContentTypeTree == "public.content" || kMDItemContentTypeTree == "public.composite-content" || kMDItemContentTypeTree == "public.archive" || kMDItemContentTypeTree == "com.apple.package" || kMDItemContentTypeTree == "public.folder")';
+  return `${nameFilter} && ${typeFilter}`;
 }
 
 function getNormalizedTerms(rawQuery: string): string[] {
@@ -209,14 +212,11 @@ const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose }) =>
       setIsLoading(true);
       try {
         const spotlightQuery = buildNameOnlySpotlightQuery(trimmed);
-        const response = await window.electron.execCommand('mdfind', ['-onlyin', currentScope.path, spotlightQuery]);
+        // Use direct IPC to mdfind — no shell overhead
+        const lines = await window.electron.mdfindSearch(currentScope.path, spotlightQuery, 200);
         if (searchRequestRef.current !== requestId) return;
 
         const terms = getNormalizedTerms(trimmed);
-        const lines = response.stdout
-          .split('\n')
-          .map((line) => line.trim())
-          .filter(Boolean);
 
         // Hard guard: keep only entries whose own file/folder name matches all terms.
         const strictNameMatches = lines.filter((filePath) => matchesFileNameTerms(filePath, terms));
@@ -256,7 +256,7 @@ const FileSearchExtension: React.FC<FileSearchExtensionProps> = ({ onClose }) =>
           setIsLoading(false);
         }
       }
-    }, 140);
+    }, 60);
 
     return () => window.clearTimeout(timer);
   }, [query, selectedScope]);
